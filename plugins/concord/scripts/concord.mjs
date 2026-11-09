@@ -8,19 +8,20 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { git, killAll, run as runProc, tail, which } from './lib/proc.mjs';
 import {
-  ConcordError, acquireLock, dirtyEntries, fingerprint, gitlinks, listRuns, locate, newRunId,
-  readJson, runDir, writeJson,
+  ConcordError, acquireLock, dirtyEntries, fingerprint, formatEntry, gitlinks, listRuns, locate, newRunId,
+  readJson, runDir, snapshotTrees, writeJson,
 } from './lib/state.mjs';
 import {
   CLAUDE_TIERS, DOCS, RISK, TTL_S, cachePath, catalogAge, loadCatalog, refreshCatalog, resolveExternal, routeTask,
 } from './lib/models.mjs';
 import * as W from './lib/workflow.mjs';
+import { KIND_NOTE, classifyExplicit, discoverChecks } from './lib/checks.mjs';
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 const SELF = fileURLToPath(import.meta.url);
 const OPEN = new Set(['active', 'awaiting_session', 'failed', 'validated']);
 const LIMITS = { cli_timeout_s: [480, 30, 3600], test_timeout_s: [300, 10, 3600], max_repairs: [2, 0, 5] };
-const SPEC_KEYS = new Set(['request', 'tests', 'policy', 'models', 'limits']);
+const SPEC_KEYS = new Set(['request', 'tests', 'policy', 'models', 'limits', 'require_clean']);
 const EXTERNAL = { proposal: 'codex', review: 'grok', plan: 'codex', qa: 'codex' };
 const MAX_NOTE = 4000;
 const MAX_DIFF = 150 * 1024;
@@ -30,11 +31,17 @@ const HELP = `贞观·政事堂 · Concord ${VERSION} — Claude Code plugin hel
 Usage: node concord.mjs <command> [options]
 
 Commands (all short-lived; no daemon; state in <git-dir>/concord/runs/<id>):
-  preflight [--repo P] [--json]       Local checks only: git, clean tree, CLIs on PATH, model cache.
+  preflight [--repo P] [--json] [--require-clean]
+                                      Local checks only: git, CLIs on PATH, model cache. A dirty tree is a
+                                      warning (pre-existing work is recorded as the run baseline);
+                                      --require-clean makes it a failure.
                                       Runs no model CLI, no inference, no networking.
   models [--refresh] [--json]         Show cached model catalog. --refresh asks local CLIs
                                       (codex debug models, grok models) for account-listed models.
-  start --spec FILE [--repo P]        Create a run from a JSON spec (requires clean checkout).
+  checks [--repo P] [--json]          Show the check command Concord would autodetect from package.json
+                                      (nearest package from the cwd; scripts/packageManager/lockfiles).
+  start --spec FILE [--repo P]        Create a run from a JSON spec. A dirty checkout is allowed: its exact
+                                      state is snapshotted as the baseline (spec require_clean:true refuses).
   advance RUN [--done STEP [--executor subagent|main] [--note-file F]]
               [--failed STEP --note-file F] [--retry] [--budget S]
                                       Execute helper-owned steps (Codex/Grok/tests/QA) until the
@@ -48,9 +55,10 @@ Commands (all short-lived; no daemon; state in <git-dir>/concord/runs/<id>):
                                       Record the human decision bound to the validated state.
                                       Never merges, pushes or deploys.
 
-Spec (JSON): {"request": str, "tests": [["npm","test"]] | ["npm test"],
+Spec (JSON): {"request": str, "tests" (optional; autodetected when omitted): [["npm","test"]] | ["npm test"],
   "policy": "full"|"fast", "models": {"proposal","review","plan","qa": id|"account_default",
-  "worker","repair": "haiku"|"sonnet"|"opus"}, "limits": {"cli_timeout_s","test_timeout_s","max_repairs"}}
+  "worker","repair": "haiku"|"sonnet"|"opus"}, "limits": {"cli_timeout_s","test_timeout_s","max_repairs"},
+  "require_clean": false}
 Test strings are split into argv (simple quotes only); shell operators are rejected. No shell is used.
 
 Env: CONCORD_CODEX_BIN, CONCORD_GROK_BIN (CLI paths), CONCORD_STATE_DIR, CONCORD_CACHE_DIR.
@@ -60,7 +68,7 @@ ${W.METAPHOR}`;
 
 function parseArgs(argv) {
   const pos = []; const opt = {};
-  const flags = new Set(['--json', '--refresh', '--retry', '--help', '-h', '--version']);
+  const flags = new Set(['--json', '--refresh', '--retry', '--help', '-h', '--version', '--require-clean']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (flags.has(a)) opt[a.replace(/^-+/, '')] = true;
@@ -97,10 +105,11 @@ function validateSpec(spec) {
   if (typeof spec.request !== 'string' || !spec.request.trim() || spec.request.length > 20000) {
     throw new ConcordError('spec.request must be a non-empty string (≤ 20000 chars)', 'spec');
   }
-  if (!Array.isArray(spec.tests) || spec.tests.length === 0 || spec.tests.length > 10) {
-    throw new ConcordError('spec.tests needs 1..10 test commands; Concord never passes without real tests', 'no_tests');
+  // tests omitted → autodiscovered in start; an explicit list (even empty) is never second-guessed.
+  if (spec.tests !== undefined && (!Array.isArray(spec.tests) || spec.tests.length === 0 || spec.tests.length > 10)) {
+    throw new ConcordError('spec.tests needs 1..10 test commands (or omit it to autodetect); Concord never passes without real checks', 'no_tests');
   }
-  const tests = spec.tests.map((t) => {
+  const tests = spec.tests?.map((t) => {
     const argv = typeof t === 'string' ? splitCommand(t) : t;
     if (!Array.isArray(argv) || !argv[0] || !argv.every((a) => typeof a === 'string' && !a.includes('\0'))) {
       throw new ConcordError(`invalid test command: ${JSON.stringify(t)}`, 'spec');
@@ -119,7 +128,8 @@ function validateSpec(spec) {
     limits[k] = v;
   }
   for (const k of Object.keys(spec.limits ?? {})) if (!(k in LIMITS)) throw new ConcordError(`unknown limits key: ${k}`, 'spec');
-  return { request: spec.request, tests, policy, models: m, limits };
+  if (spec.require_clean !== undefined && typeof spec.require_clean !== 'boolean') throw new ConcordError('spec.require_clean must be a boolean', 'spec');
+  return { request: spec.request, tests: tests ?? null, policy, models: m, limits, require_clean: spec.require_clean === true };
 }
 
 // ------------------------------------------------------------------ run store
@@ -317,12 +327,14 @@ const STAGES = {
     const n = r.steps.filter((s) => s.role === 'test').length + 1;
     const id = `test-${n}`;
     const before = fingerprint(store.loc);
-    const step = beginStep(store, id, 'test', { fingerprint: before.sha256, commands: [] });
+    const sel = r.test_selection;
+    const testCwd = path.join(store.loc.repo, sel?.cwd ?? '');
+    const step = beginStep(store, id, 'test', { fingerprint: before.sha256, commands: [], check_kind: describeChecks(r).kind, check_source: sel?.source ?? 'spec.tests' });
     let ok = true;
     for (const [i, argv] of r.tests.entries()) {
       const out = store.p('logs', `${id}.${i + 1}.stdout.log`);
       const err = store.p('logs', `${id}.${i + 1}.stderr.log`);
-      const res = await runProc(argv, { cwd: store.loc.repo, env: { ...process.env, CONCORD_RUN_ID: r.id }, timeoutMs: r.limits.test_timeout_s * 1000, stdoutPath: out, stderrPath: err });
+      const res = await runProc(argv, { cwd: testCwd, env: { ...process.env, CONCORD_RUN_ID: r.id }, timeoutMs: r.limits.test_timeout_s * 1000, stdoutPath: out, stderrPath: err });
       const passed = !res.error && !res.timedOut && res.code === 0;
       step.commands.push({ argv, code: res.code, signal: res.signal, timed_out: res.timedOut, error: res.error, ms: res.ms, passed,
         logs: { stdout: path.relative(store.dir, out), stderr: path.relative(store.dir, err) } });
@@ -349,10 +361,12 @@ const STAGES = {
       r.phase = 'test'; r.policy_notes.push(`${now()}: working state changed after tests; re-running tests before QA.`); store.save(); return;
     }
     const n = r.steps.filter((s) => s.role === 'qa').length + 1;
-    const diffAll = git(store.loc.repo, ['diff', '--no-color', '--no-ext-diff', r.baseline.head]);
-    const diff = diffAll.length > MAX_DIFF ? `${diffAll.slice(0, MAX_DIFF)}\n…[diff truncated at ${MAX_DIFF} bytes; inspect files directly]` : diffAll || '(no tracked changes)';
-    const untracked = git(store.loc.repo, ['ls-files', '--others', '--exclude-standard']).trim();
-    const tests = lastTest.commands.map((c) => `- ${JSON.stringify(c.argv)} exit ${c.code}`).join('\n');
+    const diffAll = git(store.loc.repo, ['diff-tree', '-p', '-r', '--no-color', '--no-ext-diff', '--no-textconv', baseTree(r), currentTree(store.loc)]);
+    const diff = diffAll.length > MAX_DIFF ? `${diffAll.slice(0, MAX_DIFF)}\n…[diff truncated at ${MAX_DIFF} bytes; inspect files directly]` : diffAll || '(no changes since the run started)';
+    const had = new Set((r.baseline.dirty ?? []).filter((e) => e.xy === '??').map((e) => e.path));
+    const untracked = git(store.loc.repo, ['ls-files', '-z', '--others', '--exclude-standard']).split('\0').filter((p) => p && !had.has(p)).join('\n');
+    const kind = KIND_NOTE[lastTest.check_kind] ? lastTest.check_kind : 'custom';
+    const tests = `${lastTest.commands.map((c) => `- ${JSON.stringify(c.argv)} exit ${c.code}`).join('\n')}${kind === 'test' ? '' : `\nNOTE (kind=${kind}): ${KIND_NOTE[kind]}. Passing it is NOT evidence that behaviour was tested; verify behaviour by reading the code.`}`;
     const plan = { summary: store.readArtifact('plan')?.summary, tasks: r.tasks.map(({ id, title, files, status }) => ({ id, title, files, status })) };
     const res = await runCli(store, `qa-${n}`, 'qa', W.qaPrompt(r, { plan, tests, diff, untracked }), W.SCHEMAS.qa);
     if (!res) return;
@@ -366,7 +380,7 @@ const STAGES = {
     }
     if (qa.passed) {
       if (!fastGate(store, res.step.id)) return; // never validate a fast run with non-docs changes
-      r.validation = { fingerprint: fp, tests_step: lastTest.id, qa_step: res.step.id, at: now() };
+      r.validation = { fingerprint: fp, tests_step: lastTest.id, qa_step: res.step.id, check_kind: kind, check_note: KIND_NOTE[kind], at: now() };
       r.status = 'validated'; r.phase = 'done'; store.save(); return;
     }
     store.save();
@@ -375,13 +389,18 @@ const STAGES = {
   },
 };
 
-/** Modified/added/deleted tracked paths (staged or not) plus new untracked paths vs the baseline. */
+/**
+ * Tree to compare against: the exact starting working content (v0.2.1+), or HEAD for
+ * persisted v0.2.0 runs (those always started clean, so HEAD was the baseline).
+ */
+const baseTree = (r) => r.baseline.work_tree || r.baseline.head;
+const currentTree = (loc) => snapshotTrees(loc, { staged: false }).work_tree;
+
+/** Paths added/modified/deleted since the START baseline (pre-existing dirty work excluded). */
 function changedPaths(store) {
-  const { repo, stateRoot } = store.loc;
-  const own = path.relative(repo, stateRoot);
-  const tracked = git(repo, ['diff', '--name-only', '--no-renames', '-z', store.run.baseline.head]).split('\0');
-  const untracked = git(repo, ['ls-files', '-z', '--others', '--exclude-standard']).split('\0');
-  return [...new Set([...tracked, ...untracked].filter((p) => p && !(own && !own.startsWith('..') && p.startsWith(`${own}/`))))].sort();
+  const { repo } = store.loc;
+  return git(repo, ['diff-tree', '-r', '--name-only', '--no-renames', '-z', baseTree(store.run), currentTree(store.loc)])
+    .split('\0').filter(Boolean).sort();
 }
 
 /**
@@ -418,6 +437,13 @@ function needRepair(store, cause) {
 
 // ------------------------------------------------------------------ next action
 
+function describeChecks(r) {
+  const s = r.test_selection ?? { mode: 'explicit', kind: 'custom', source: 'spec.tests (saved run without check metadata)' };
+  const kind = KIND_NOTE[s.kind] ? s.kind : 'custom';
+  return { mode: s.mode, commands: r.tests, cwd: s.cwd || '.', kind, source: s.source, note: KIND_NOTE[kind],
+    behavioural_tests: kind === 'test' };
+}
+
 function cmdFor(store, ...args) {
   return ['node', SELF, ...args, '--repo', store.loc.repo];
 }
@@ -432,7 +458,8 @@ function nextAction(store) {
   if (['cancelled', 'approved', 'rejected'].includes(r.status)) return { ...base, action: 'none', message: `Run is ${r.status}.` };
   if (r.status === 'validated') {
     return { ...base, action: 'await_human', validation: r.validation,
-      message: '天子决之 · 人工审批: validated. The human reviews the working tree; an approval only records review bound to this exact state. Nothing is committed, pushed or deployed.' };
+      message: '天子决之 · 人工审批: validated. The human reviews the working tree; an approval only records review bound to this exact state. Nothing is committed, pushed or deployed.' +
+        (r.validation?.check_kind && r.validation.check_kind !== 'test' ? ` Validation gate was ${r.validation.check_kind}: ${r.validation.check_note}.` : '') };
   }
   if (r.phase === 'implement') {
     const done = new Set(r.tasks.filter((t) => t.status === 'done').map((t) => t.id));
@@ -440,7 +467,8 @@ function nextAction(store) {
     const id = `task-${t.id}`;
     return { ...base, action: 'implement', step: id, task: t, tier: t.tier, tier_reason: t.tier_reason,
       agent: { subagent_type: 'general-purpose', model: t.tier },
-      rules: 'Edit only what this task needs in the current checkout. Do not commit, stash, reset, push or run destructive git commands. Do not run the configured tests as a substitute for Concord validation.',
+      rules: `Edit only what this task needs in the current checkout. Do not commit, stash, reset, push or run destructive git commands. ${W.PRESERVE_RULE} Do not run the configured tests as a substitute for Concord validation.`,
+      baseline: W.summarizeBaseline(r.baseline),
       done: cmdFor(store, 'advance', r.id, '--done', id, '--executor', 'subagent|main'),
       progress: `${done.size}/${r.tasks.length} tasks done` };
   }
@@ -448,7 +476,8 @@ function nextAction(store) {
     const id = `repair-${r.repairs_used + 1}`;
     return { ...base, action: 'repair', step: id, round: r.repairs_used + 1, max_rounds: r.limits.max_repairs, cause: r.repair_cause,
       agent: { subagent_type: 'general-purpose', model: r.models.repair_override || 'sonnet' },
-      rules: 'Fix only the reported failures/findings in the current checkout. Do not commit, stash, reset or push.',
+      rules: `Fix only the reported failures/findings in the current checkout. Do not commit, stash, reset or push. ${W.PRESERVE_RULE}`,
+      baseline: W.summarizeBaseline(r.baseline),
       done: cmdFor(store, 'advance', r.id, '--done', id, '--executor', 'subagent|main') };
   }
   return { ...base, action: 'continue', message: 'Helper-owned steps remain; run advance again.', next: cmdFor(store, 'advance', r.id) };
@@ -477,6 +506,20 @@ async function cmdStart(loc, opt) {
   let raw;
   try { raw = JSON.parse(fs.readFileSync(path.resolve(opt.spec), 'utf8')); } catch (e) { throw new ConcordError(`cannot read spec: ${e.message}`, 'spec'); }
   const spec = validateSpec(raw);
+  let selection = null;
+  if (!spec.tests) {
+    const found = discoverChecks(loc);
+    if (!found.selected) {
+      throw new ConcordError(`no reliable check command could be detected (${found.reason}${found.skipped.length ? `; skipped: ${found.skipped.map((x) => `${x.package}${x.script ? `:${x.script}` : ''} ${x.reason}`).join('; ')}` : ''}). Ask the user which command gates the run and put it in spec.tests; Concord will not pass without a real check.`, 'no_tests');
+    }
+    const { argv, ...meta } = found.selected;
+    spec.tests = [argv];
+    selection = { mode: 'auto', ...meta, skipped: found.skipped };
+  }
+  if (!selection) {
+    const kind = classifyExplicit(spec.tests);
+    selection = { mode: 'explicit', source: 'spec.tests (user-specified)', kind, cwd: '', note: KIND_NOTE[kind] };
+  }
   const catalog = loadCatalog();
   const models = {};
   for (const [role, provider] of Object.entries(EXTERNAL)) {
@@ -491,13 +534,17 @@ async function cmdStart(loc, opt) {
     const links = gitlinks(loc);
     if (links.length) throw new ConcordError(`submodules/nested repositories are not supported (their contents are not fingerprinted): ${links.slice(0, 10).join(', ')}`, 'submodule');
     const dirty = dirtyEntries(loc);
-    if (dirty.length) {
-      throw new ConcordError(`checkout is not clean; Concord will not stash, reset, commit or overwrite your work. Commit or set aside these first:\n  ${dirty.slice(0, 20).join('\n  ')}`, 'dirty');
+    if (spec.require_clean && dirty.length) {
+      throw new ConcordError(`require_clean is set and the checkout is not clean; Concord will not stash, reset, commit or overwrite your work. Commit or set aside these first:\n  ${dirty.slice(0, 20).map(formatEntry).join('\n  ')}`, 'dirty');
     }
     const headR = git(loc.repo, ['rev-parse', '--verify', 'HEAD'], { allowFail: true });
     if (headR.status !== 0) throw new ConcordError('repository has no commits; create an initial commit first', 'no_head');
     const id = newRunId();
     const store = new Store(loc, id);
+    const trees = snapshotTrees(loc); // temp index copy only; the real index is not touched
+    // Keep the snapshot reachable (private ref, not a branch) so gc cannot prune it mid-run.
+    const baseRef = `refs/concord/baseline/${id}`;
+    const pinned = git(loc.repo, ['update-ref', baseRef, trees.work_tree], { allowFail: true }).status === 0;
     const notes = [];
     let policy = spec.policy;
     if (policy === 'fast' && !W.trivialDocsRequest(spec.request, RISK)) {
@@ -506,15 +553,18 @@ async function cmdStart(loc, opt) {
     } else if (policy === 'fast') notes.push('fast policy: request matches the trivial docs allowlist; Codex proposal+plan combined.');
     store.run = {
       schema: 1, id, version: VERSION, created_at: now(), repo: loc.repo, request: spec.request, tests: spec.tests,
-      requested_policy: spec.policy, policy, policy_notes: notes, limits: spec.limits, models,
+      test_selection: selection, requested_policy: spec.policy, policy, policy_notes: notes, limits: spec.limits, models,
       catalog: catalog ? { refreshed_at: catalog.refreshed_at, source: cachePath() } : null,
-      baseline: { head: headR.stdout.trim(), fingerprint: fingerprint(loc).sha256, clean: true },
+      require_clean: spec.require_clean,
+      baseline: { head: headR.stdout.trim(), fingerprint: fingerprint(loc).sha256, clean: dirty.length === 0, dirty,
+        index_tree: trees.index_tree, work_tree: trees.work_tree, ref: pinned ? baseRef : null },
       status: 'active', phase: 'proposal', steps: [], tasks: [], repairs_used: 0, validation: null, approval: null, failure: null,
       execution: 'serial in the current checkout (parallel subagents are not supported in v0.2)',
     };
     store.save();
     writeJson(store.p('spec.json'), raw);
-    return { run: id, status: 'active', policy, policy_notes: notes, state_dir: store.dir, next: cmdFor(store, 'advance', id) };
+    const baseline = W.summarizeBaseline(store.run.baseline);
+    return { run: id, status: 'active', policy, policy_notes: notes, baseline, checks: describeChecks(store.run), state_dir: store.dir, next: cmdFor(store, 'advance', id) };
   });
 }
 
@@ -623,12 +673,12 @@ function cmdStatus(loc, id, opt) {
   let lock = null; try { lock = JSON.parse(fs.readFileSync(lockFile, 'utf8')); } catch { /* none */ }
   const report = {
     run: r.id, status: r.status, phase: r.phase, policy: r.policy, policy_notes: r.policy_notes, repo: r.repo,
-    baseline: r.baseline.head, working_state: fp,
+    baseline: r.baseline.head, baseline_state: W.summarizeBaseline(r.baseline), working_state: fp,
     validation: r.validation ? { ...r.validation, current: r.validation.fingerprint === fp } : null,
     approval: r.approval, failure: r.failure, helper_running: lock?.run === r.id ? lock.pid : null,
     steps: r.steps.map(({ id: sid, attempt, label, provider, model, status, ms, error, reason, executor }) => ({ id: sid, attempt, label, provider, model, status, ms, error, reason, executor })),
     tasks: r.tasks.map(({ id: tid, title, status, tier, tier_reason }) => ({ id: tid, title, status, tier, tier_reason })),
-    repairs: `${r.repairs_used}/${r.limits.max_repairs}`, next: nextAction(store), state_dir: store.dir,
+    checks: describeChecks(r), repairs: `${r.repairs_used}/${r.limits.max_repairs}`, next: nextAction(store), state_dir: store.dir,
     discussion: summarizeDiscussion(store), note: W.METAPHOR,
   };
   if (opt.json) return report;
@@ -636,6 +686,8 @@ function cmdStatus(loc, id, opt) {
   const lines = [
     `贞观·政事堂 · Concord ${r.id}  status=${r.status} phase=${r.phase} policy=${r.policy}`,
     `repo ${r.repo}  baseline ${r.baseline.head.slice(0, 10)}  working-state ${fp.slice(0, 12)}${r.validation ? (report.validation.current ? ' (validated)' : ' (CHANGED since validation)') : ''}`,
+    ...(r.baseline.dirty?.length ? [`baseline: ${r.baseline.dirty.length} pre-existing uncommitted entr${r.baseline.dirty.length === 1 ? 'y' : 'ies'} preserved (${report.baseline_state.entries.slice(0, 5).join('; ')}${r.baseline.dirty.length > 5 ? '; …' : ''})`] : []),
+    `checks: ${r.tests.map((a) => a.join(' ')).join(' && ')} [${report.checks.mode}, ${report.checks.kind}${report.checks.behavioural_tests ? '' : ` — ${report.checks.note}`}]`,
     ...r.policy_notes.map((n) => `note: ${n}`),
     'steps:',
     ...r.steps.map((s) => {
@@ -697,6 +749,8 @@ function cmdPreflight(loc, opt) {
   const age = catalogAge(catalog);
   const b = bins();
   const dirty = dirtyEntries(loc);
+  const strict = opt['require-clean'] === true;
+  const detected = discoverChecks(loc);
   const links = gitlinks(loc);
   const open = listRuns(loc).map((id) => { try { return readJson(path.join(runDir(loc, id), 'run.json')); } catch { return null; } })
     .filter((r) => r && OPEN.has(r.status)).map((r) => `${r.id} (${r.status})`);
@@ -705,20 +759,24 @@ function cmdPreflight(loc, opt) {
     node: { ok: Number(process.versions.node.split('.')[0]) >= 18, value: process.versions.node },
     git_repo: { ok: true, value: loc.repo },
     has_commit: { ok: head.status === 0 },
-    clean_checkout: { ok: dirty.length === 0, value: dirty.slice(0, 10) },
+    // Pre-existing work is allowed (it becomes the run baseline): a warning unless --require-clean.
+    clean_checkout: { ok: !strict || dirty.length === 0, warn: dirty.length > 0, value: dirty.slice(0, 10).map(formatEntry),
+      note: dirty.length ? (strict ? '--require-clean: checkout must be clean' : 'dirty checkout: pre-existing changes will be recorded as the baseline and preserved') : undefined },
     no_submodules: { ok: links.length === 0, value: links.slice(0, 10) },
     no_open_run: { ok: open.length === 0, value: open },
+    test_command: { ok: true, warn: !detected.selected, value: detected.selected ? `${detected.selected.argv.join(' ')} [${detected.selected.kind}] from ${detected.selected.source}` : `none auto-detected (${detected.reason}); pass spec tests / --test` },
     codex_on_path: { ok: !!which(b.codex), value: which(b.codex) },
     grok_on_path: { ok: !!which(b.grok), value: which(b.grok) },
     model_cache: { ok: true, value: catalog ? `${cachePath()} refreshed ${catalog.refreshed_at}${age > TTL_S ? ' (stale; models --refresh)' : ''}` : 'none (account defaults will be used)' },
     state_dir: { ok: true, value: loc.stateRoot },
   };
   const ok = Object.values(checks).every((c) => c.ok);
-  const out = { ok, checks, note: 'Local checks only: no model CLI was executed, no inference, no networking. Login state is not verified.' };
+  const warnings = Object.entries(checks).filter(([, c]) => c.ok && c.warn).map(([k]) => k);
+  const out = { ok, warnings, checks, note: 'Local checks only: no model CLI was executed, no inference, no networking. Login state is not verified.' };
   if (!ok) process.exitCode = 1;
   if (opt.json) return out;
-  return [`Concord ${VERSION} preflight: ${ok ? 'OK' : 'NOT READY'}`,
-    ...Object.entries(checks).map(([k, c]) => `  ${c.ok ? '✓' : '✗'} ${k}${c.value !== undefined && c.value !== true ? `: ${Array.isArray(c.value) ? c.value.join(', ') || '-' : c.value}` : ''}`),
+  return [`Concord ${VERSION} preflight: ${ok ? (warnings.length ? 'OK (with warnings)' : 'OK') : 'NOT READY'}`,
+    ...Object.entries(checks).map(([k, c]) => `  ${c.ok ? (c.warn ? '⚠' : '✓') : '✗'} ${k}${c.value !== undefined && c.value !== true ? `: ${Array.isArray(c.value) ? c.value.join(', ') || '-' : c.value}` : ''}`),
     out.note].join('\n');
 }
 
@@ -756,6 +814,12 @@ async function main(argv) {
   const loc = locate(opt.repo);
   switch (cmd) {
     case 'preflight': return cmdPreflight(loc, opt);
+    case 'checks': {
+      const d = discoverChecks(loc);
+      if (opt.json) return { ...d, selected: d.selected && { ...d.selected, command: d.selected.argv }, behavioural_tests: d.selected?.kind === 'test' };
+      return d.selected ? `${d.selected.argv.join(' ')}  (cwd ${d.selected.cwd || '.'}; ${d.selected.kind}: ${d.selected.note}; ${d.selected.source})`
+        : `no reliable check command detected: ${d.reason}${d.skipped.map((x) => `\n  skipped ${x.package}${x.script ? `:${x.script}` : ''}: ${x.reason}`).join('')}`;
+    }
     case 'start': return cmdStart(loc, opt);
     case 'advance': return cmdAdvance(loc, resolveRunId(loc, pos[1]), opt);
     case 'resume': return withLock(loc, resolveRunId(loc, pos[1]), (lock) => {

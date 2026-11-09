@@ -22,7 +22,10 @@ export function locate(repoArg) {
   const stateRoot = process.env.CONCORD_STATE_DIR
     ? path.resolve(process.env.CONCORD_STATE_DIR)
     : path.join(common, 'concord');
-  return { repo: fs.realpathSync(top), stateRoot, runsDir: path.join(stateRoot, 'runs') };
+  const repo = fs.realpathSync(top);
+  let cwd = start; try { cwd = fs.realpathSync(start); } catch { /* keep */ }
+  if (cwd !== repo && !cwd.startsWith(`${repo}${path.sep}`)) cwd = repo;
+  return { repo, cwd, stateRoot, runsDir: path.join(stateRoot, 'runs') };
 }
 
 export function newRunId(now = new Date()) {
@@ -127,11 +130,58 @@ export function gitlinks(loc) {
   return [...staged, ...nested];
 }
 
-/** `git status --porcelain` lines for tracked + untracked (non-ignored) changes. */
-export function dirtyEntries(loc) {
+const inOwnState = (loc, p) => {
   const own = path.relative(loc.repo, loc.stateRoot);
-  const ownInside = own && !own.startsWith('..') && !path.isAbsolute(own);
-  return git(loc.repo, ['status', '--porcelain=v1', '--untracked-files=all'])
-    .split('\n').filter(Boolean)
-    .filter((l) => !(ownInside && (l.slice(3) === own || l.slice(3).startsWith(`${own}/`))));
+  return own && !own.startsWith('..') && !path.isAbsolute(own) && (p === own || p.startsWith(`${own}/`));
+};
+
+/**
+ * Parsed `git status --porcelain=v1 -z` entries {xy, path, orig?} for tracked + untracked
+ * (non-ignored) changes. -z means names with spaces/unicode are never quoted or split.
+ */
+export function dirtyEntries(loc) {
+  const f = git(loc.repo, ['status', '--porcelain=v1', '-z', '--untracked-files=all']).split('\0');
+  const out = [];
+  for (let i = 0; i < f.length; i++) {
+    if (f[i].length < 4) continue;
+    const e = { xy: f[i].slice(0, 2), path: f[i].slice(3) };
+    if (/[RC]/.test(e.xy)) e.orig = f[++i]; // rename/copy: next field is the source path
+    if (!inOwnState(loc, e.path)) out.push(e);
+  }
+  return out;
+}
+
+export const formatEntry = (e) => `${e.xy} ${e.orig ? `${e.orig} -> ` : ''}${e.path}`;
+
+/**
+ * Exact content snapshot of the starting state as git TREE objects, built with a throwaway
+ * copy of the index (GIT_INDEX_FILE). The user's real index is never written; nothing is
+ * committed and no branch moves (only unreferenced blobs/trees are added to the object store).
+ *   index_tree: what is staged (null if the index cannot be written as a tree, e.g. conflicts)
+ *   work_tree:  tracked + non-ignored untracked files as they are on disk (excludes Concord state)
+ */
+export function snapshotTrees(loc, { staged = true } = {}) {
+  const real = git(loc.repo, ['rev-parse', '--path-format=absolute', '--git-path', 'index']).trim();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'concord-index-'));
+  const env = { GIT_INDEX_FILE: path.join(tmp, 'index') };
+  try {
+    if (fs.existsSync(real)) {
+      fs.copyFileSync(real, env.GIT_INDEX_FILE);
+      // Backdate the copy: a fresh mtime would make git trust stale stat data ("racy git"), missing
+      // same-size edits made within the timestamp granularity. Timestamp 1 (0 disables the check) forces every entry to be rehashed.
+      fs.utimesSync(env.GIT_INDEX_FILE, 1, 1);
+    }
+    else git(loc.repo, ['read-tree', 'HEAD'], { env });
+    let index_tree = null;
+    if (staged) {
+      const r = git(loc.repo, ['write-tree'], { env, allowFail: true });
+      if (r.status === 0) index_tree = r.stdout.trim();
+    }
+    const own = path.relative(loc.repo, loc.stateRoot);
+    const spec = own && !own.startsWith('..') && !path.isAbsolute(own) ? [`:(exclude,literal)${own}`] : [];
+    git(loc.repo, ['add', '-A', '--', '.', ...spec], { env });
+    return { index_tree, work_tree: git(loc.repo, ['write-tree'], { env }).trim() };
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 }

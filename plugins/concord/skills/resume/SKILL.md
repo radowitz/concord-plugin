@@ -22,4 +22,4 @@ disable-model-invocation: true
    - `await_human` or `none`: summarise with `H status <run-id>` and stop.
 
 Before you re-do an `implement` step, check the working tree. A previous session may have
-partly finished it. Never stash, reset or discard files to get a clean state.
+partly finished it. Never stash, reset or discard files to get a clean state; pre-existing uncommitted work in `baseline` belongs to the user.

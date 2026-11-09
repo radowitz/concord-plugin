@@ -67,8 +67,10 @@ export function run(argv, { cwd, env, timeoutMs, stdoutPath, stderrPath, stdinPa
 }
 
 /** Short synchronous git call (local, no network). Throws with stderr on failure. */
-export function git(cwd, args, { allowFail = false, maxBuffer = 64 * 1024 * 1024 } = {}) {
-  const r = spawnSync('git', args, { cwd, encoding: 'utf8', shell: false, maxBuffer, timeout: 60000 });
+export function git(cwd, args, { allowFail = false, maxBuffer = 64 * 1024 * 1024, env } = {}) {
+  // GIT_OPTIONAL_LOCKS=0: read-only commands (status, diff) must never rewrite the user's real index.
+  const r = spawnSync('git', args, { cwd, encoding: 'utf8', shell: false, maxBuffer, timeout: 120000,
+    env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: '0' } });
   if (r.error) throw new Error(`git ${args[0]}: ${r.error.message}`);
   if (r.status !== 0 && !allowFail) throw new Error(`git ${args.join(' ')}: ${(r.stderr || '').trim()}`);
   return allowFail ? r : r.stdout;

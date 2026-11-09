@@ -1,4 +1,4 @@
-# 贞观·政事堂 · Concord — Claude Code plugin v0.2.0
+# 贞观·政事堂 · Concord — Claude Code plugin v0.2.1
 
 **English** · [中文](#中文)
 
@@ -45,9 +45,11 @@ claude plugin install concord@concord-local
 ## Use
 
 ```text
-/concord:run --test 'npm test' add server-side validation to the signup form
-/concord:run --test 'python3 -m pytest -q' --tier worker=opus --model qa=<account-listed-id> fix the race in the job queue
-/concord:run --policy fast --test 'node scripts/check-docs.mjs' Fix the typo in README.md
+/concord:run add server-side validation to the signup form
+/concord:run                # bare: uses the task from the current conversation (asks only if there is none)
+/concord:run --tier worker=opus --model qa=<account-listed-id> fix the race in the job queue
+/concord:run --policy fast Fix the typo in README.md
+/concord:run --test 'python3 -m pytest -q' fix the race in the job queue   # optional override for non-Node projects
 /concord:status            # latest run: steps, providers/models, tasks, 政事堂议事 artifacts, next action
 /concord:resume latest     # after a restart: reports interrupted steps, re-runs nothing on its own
 ```
@@ -56,7 +58,8 @@ Helper commands are listed in `node plugins/concord/scripts/concord.mjs --help`.
 
 ## How it works
 
-- **Starting a run.** The current checkout must be clean (no tracked changes, no untracked non-ignored files) before the run starts. Concord never stashes, resets, commits or overwrites your work. Implementation runs serially in this checkout. v0.2 does not run parallel subagents.
+- **Starting a run.** The checkout does not need to be clean. Staged or unstaged tracked changes and untracked non-ignored files (for example `.vscode/extensions.json`) are recorded as the run's baseline: their exact content is snapshotted as git tree objects using a temporary index copy (your real `.git/index` is never written, nothing is committed, no branch moves). QA diffs and the fast-policy path gate compare against that baseline, not `HEAD`, so pre-existing work is neither audited nor blocks a docs fix. Workers are told to preserve it. Add `--require-clean` (spec `require_clean: true`) to refuse a dirty start; `preflight --require-clean` is the matching strict check. Concord never stashes, resets, commits or overwrites your work. Implementation runs serially in this checkout. v0.2 does not run parallel subagents.
+- **Checks.** `--test` is optional. When the spec has no `tests`, `start` reads the nearest `package.json` from the current directory up to the repo root (no workspace scanning): `scripts` in the order `test`, `check`, `typecheck`, `lint`, `build` (placeholders like `echo ... no test specified` and watch scripts are skipped), the package manager from `packageManager` or the lockfile (`pnpm-lock.yaml`, `yarn.lock`, `bun.lock[b]`, `package-lock.json`; conflicting lockfiles are not guessed), and runs `<pm> run <script>` as argv in that package directory. Nothing is installed and no shell is used (a `packageManager` shim such as corepack may still fetch its own binary; that is outside Concord). The choice, its source and its kind persist in the run and show in `status`; a typecheck/lint/build gate is reported as such and QA is told it is not a behavioural test. If nothing reliable is found, `start` fails with `no_tests` and the skill asks you. `node scripts/concord.mjs checks --json` previews the choice. Explicit `tests` always win.
 - **State.** Run state lives in `$(git rev-parse --git-common-dir)/concord/runs/<id>/`, which is never tracked. There is one lock per repository. A step left running when the helper died is reported as `interrupted`, and only `advance --retry` re-runs it.
 - **Validation.** Tests and QA must see the same working-state fingerprint. The fingerprint covers tracked and untracked files, but excludes `.git` and Concord's own state. Missing or failing tests never pass. Blocking QA findings require a repair, and repair rounds are capped (default 2). Malformed plan or QA output is rejected. Any edit after validation invalidates it. A repair that changes nothing stops the run instead of replaying tests and QA.
 - **Model routing (吏部选才).** Each task gets the `haiku`, `sonnet` or `opus` alias based on its difficulty and risk. You can override this with `--tier worker=…`. The session passes the alias to the Agent tool's `model`. Work done in the main session is recorded as "inherited, actual model unknown". Codex and Grok use your account default unless you set `--model role=id`. An override is checked against the cached account list, which shows its source and timestamp. Concord never invents model IDs and never picks the "latest" model automatically.
@@ -105,15 +108,18 @@ claude plugin install concord@concord-local
 **示例**：
 
 ```text
-/concord:run --test 'npm test' 为注册表单增加服务端校验
-/concord:run --policy fast --test 'node scripts/check-docs.mjs' 修正 README.md 中的错别字
+/concord:run 为注册表单增加服务端校验
+/concord:run                # 不带参数：使用当前对话中的任务（没有任务才询问）
+/concord:run --policy fast 修正 README.md 中的错别字
+/concord:run --test 'python3 -m pytest -q' 修复任务队列竞态   # 非 Node 项目的可选覆盖
 /concord:status
 /concord:resume latest
 ```
 
 **要点**：
 
-- **开始与执行**：开始前要求工作区干净；绝不 stash、reset、commit 或覆盖你的改动。在当前检出目录中串行实现（v0.2 不支持并行子代理）。
+- **检查命令**：`--test` 可选。spec 未给 `tests` 时，`start` 从当前目录向上读取最近的 `package.json`（不扫描 workspace）：按 `test`、`check`、`typecheck`、`lint`、`build` 选择脚本（跳过占位脚本与 watch 脚本），包管理器取自 `packageManager` 或锁文件（锁文件冲突时不猜测），在该包目录以 argv 运行 `<pm> run <script>`；不安装、不经 shell。所选命令、来源与类型会记录并显示在 `status`；仅 typecheck/lint/build 会如实标注并告知 QA 这不是行为测试。找不到可靠命令时返回 `no_tests` 并询问用户。`concord.mjs checks --json` 可预览；显式 `tests` 优先。
+- **开始与执行**：工作区不必干净。已暂存/未暂存的改动和未被忽略的未跟踪文件（如 `.vscode/extensions.json`）会作为基线保存（用临时 index 副本写成 git tree 对象；不改动真实 index，不提交，不移动分支）。QA diff 与快速策略的路径检查都以该基线为准而非 `HEAD`，原有改动不会被当作本次改动，也不会阻止文档修复。工作者会被告知保留这些改动。显式加 `--require-clean`（spec `require_clean: true`）可拒绝脏工作区；`preflight --require-clean` 为对应严格检查。绝不 stash、reset、commit 或覆盖你的改动。在当前检出目录中串行实现（v0.2 不支持并行子代理）。
 - **状态**：保存在 `git-common-dir/concord/runs/<id>/`，不会被 git 跟踪。每个仓库一把锁。中断的步骤只会标记为 `interrupted`，不会自动重跑，需要显式 `advance --retry`。
 - **验证**：测试与 QA 必须对应同一个工作区指纹（包含未跟踪文件，不含 `.git` 和自身状态）。没有测试或测试失败都不会通过。阻断性 QA 发现必须修复，修复轮次有上限；格式不合法的计划或 QA 输出会被拒绝；验证之后再改动代码，验证即失效。
 - **吏部选才（模型选择）**：按任务难度和风险选择 `haiku`、`sonnet` 或 `opus` 别名，通过 Agent 工具的 `model` 参数传入；主会话自行完成的步骤记录为“继承、实际模型未知”。Codex 和 Grok 默认使用账号默认模型；指定的模型会与带来源和时间戳的缓存账号列表核对；绝不编造模型 ID。

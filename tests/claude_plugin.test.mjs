@@ -48,14 +48,19 @@ function sandbox() {
   for (const p of ['codex', 'grok']) {
     fs.writeFileSync(path.join(bin, p), `#!/bin/sh\nexec "${process.execPath}" "${FAKE}" ${p} "$@"\n`, { mode: 0o755 });
   }
-  const env = { ...process.env, CONCORD_CODEX_BIN: path.join(bin, 'codex'), CONCORD_GROK_BIN: path.join(bin, 'grok'),
+  // Fake package managers: log "<name> <cwd> <args>" and exit FAKE_PM_EXIT (default 0). Never touch the repo.
+  for (const p of ['npm', 'pnpm', 'yarn']) {
+    fs.writeFileSync(path.join(bin, p), `#!/bin/sh\necho "${p} $PWD $*" >> "$FAKE_PM_LOG"\nexit "\${FAKE_PM_EXIT:-0}"\n`, { mode: 0o755 });
+  }
+  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_PM_LOG: path.join(root, 'pm.log'), CONCORD_CODEX_BIN: path.join(bin, 'codex'), CONCORD_GROK_BIN: path.join(bin, 'grok'),
     CONCORD_CACHE_DIR: path.join(root, 'cache'), FAKE_CALLS: path.join(root, 'calls.jsonl'), FAKE_SCENARIO: path.join(root, 'scenario.json') };
   delete env.CONCORD_STATE_DIR;
   return { root, repo, env };
 }
 
-function cli(...args) {
-  const r = spawnSync(process.execPath, [CLI, ...args], { cwd: t.repo, env: t.env, encoding: 'utf8' });
+function cli(...args) { return cliIn(t.repo, ...args); }
+function cliIn(cwd, ...args) {
+  const r = spawnSync(process.execPath, [CLI, ...args], { cwd, env: t.env, encoding: 'utf8' });
   let json = null;
   try { json = JSON.parse(r.stdout); } catch { /* text output */ }
   return { code: r.status, out: r.stdout, err: r.stderr, json };
@@ -89,8 +94,13 @@ describe('local commands', () => {
     assert.equal(pre.json.checks.codex_on_path.value, t.env.CONCORD_CODEX_BIN);
     fs.writeFileSync(path.join(t.repo, 'scratch.txt'), 'mine');
     const dirty = cli('preflight', '--json');
-    assert.equal(dirty.code, 1);
-    assert.equal(dirty.json.checks.clean_checkout.ok, false);
+    assert.equal(dirty.code, 0, 'dirty tree is a warning by default');
+    assert.equal(dirty.json.ok, true);
+    assert.deepEqual(dirty.json.warnings, ['clean_checkout', 'test_command'], 'no package.json: no autodetected check is only a warning');
+    assert.match(dirty.json.checks.clean_checkout.value[0], /scratch\.txt/);
+    const strict = cli('preflight', '--json', '--require-clean');
+    assert.equal(strict.code, 1);
+    assert.equal(strict.json.checks.clean_checkout.ok, false);
     assert.deepEqual(calls(), []);
   });
 
@@ -116,15 +126,16 @@ describe('local commands', () => {
 });
 
 describe('start guards', () => {
-  test('refuses a dirty checkout and leaves user work untouched', () => {
+  test('strict require_clean refuses a dirty checkout and leaves user work untouched', () => {
     fs.writeFileSync(path.join(t.repo, 'mine.txt'), 'user work');
     edit('user edit\n');
-    const r = start();
+    const r = start({ require_clean: true });
     assert.equal(r.code, 2);
     assert.equal(r.json.error, 'dirty');
     assert.equal(fs.readFileSync(path.join(t.repo, 'mine.txt'), 'utf8'), 'user work');
     assert.equal(fs.readFileSync(path.join(t.repo, 'app.txt'), 'utf8'), 'user edit\n');
     assert.equal(sh(t.repo, 'stash', 'list'), '');
+    assert.equal(start({ require_clean: 'yes' }).json.error, 'spec');
   });
 
   test('requires real tests, rejects shell syntax and unknown keys', () => {
@@ -439,9 +450,9 @@ describe('packaging', () => {
     assert.ok(files.includes('concord/skills/run/SKILL.md'));
     assert.ok(files.every((f) => !/\.py$|agentflow|tests?\//.test(f)), files.join('\n'));
     const manifest = JSON.parse(fs.readFileSync(path.join(out, 'concord/.claude-plugin/plugin.json'), 'utf8'));
-    assert.equal(manifest.version, '0.2.0');
+    assert.equal(manifest.version, '0.2.1');
     // Packaged helper runs standalone.
-    assert.equal(spawnSync(process.execPath, [path.join(out, 'concord/scripts/concord.mjs'), '--version'], { encoding: 'utf8' }).stdout.trim(), '0.2.0');
+    assert.equal(spawnSync(process.execPath, [path.join(out, 'concord/scripts/concord.mjs'), '--version'], { encoding: 'utf8' }).stdout.trim(), '0.2.1');
   });
 });
 
@@ -555,5 +566,316 @@ describe('real CLI compatibility', () => {
     assert.equal(big.json.providers.codex.status, 'unavailable');
     assert.match(big.json.providers.codex.error, /output too large/);
     assert.deepEqual(big.json.providers.codex.models, []);
+  });
+});
+
+describe('dirty baseline (v0.2.1)', () => {
+  const idx = () => fs.readFileSync(path.join(t.repo, '.git/index'));
+  const DOCS = { proposal_plan: [{ proposal: { summary: 'typo', approach: 'edit', risks: [], files: ['README.md'] },
+    plan: { summary: 'one', tasks: [{ id: 'D1', title: 'typo', description: 'fix typo', files: ['README.md'], depends_on: [], difficulty: 'low', risk: 'low' }] } }] };
+  const qaPrompt = (id, n = 1) => fs.readFileSync(path.join(t.repo, '.git/concord/runs', id, `prompts/qa-${n}.a1.txt`), 'utf8');
+
+  test('untracked .vscode/extensions.json does not block a real CLI start; bytes, status and index unchanged', () => {
+    fs.mkdirSync(path.join(t.repo, '.vscode'));
+    const ext = '{"recommendations": ["a.b"]}\n';
+    fs.writeFileSync(path.join(t.repo, '.vscode/extensions.json'), ext);
+    const indexBefore = idx(); const status = sh(t.repo, 'status', '--porcelain'); const head = sh(t.repo, 'rev-parse', 'HEAD');
+    const s = start();
+    assert.equal(s.code, 0, s.out + s.err);
+    assert.equal(s.json.baseline.clean, false);
+    assert.deepEqual(s.json.baseline.entries, ['?? .vscode/extensions.json']);
+    assert.ok(cli('advance', s.json.run).json.baseline.count === 1);
+    assert.equal(fs.readFileSync(path.join(t.repo, '.vscode/extensions.json'), 'utf8'), ext);
+    assert.equal(sh(t.repo, 'status', '--porcelain'), status);
+    assert.equal(sh(t.repo, 'rev-parse', 'HEAD'), head, 'no commit');
+    assert.ok(idx().equals(indexBefore), 'real index byte-for-byte unchanged');
+    assert.equal(sh(t.repo, 'stash', 'list'), '');
+    assert.equal(sh(t.repo, 'branch', '--list').trim(), '* main');
+    assert.equal(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('concord-index-') && fs.existsSync(path.join(os.tmpdir(), n, 'index'))).length, 0, 'temp index cleaned');
+    const b = runJson(s.json.run).baseline;
+    assert.equal(b.clean, false);
+    assert.match(b.work_tree, /^[0-9a-f]{40,64}$/);
+    assert.equal(sh(t.repo, 'ls-tree', '-r', '--name-only', b.work_tree).includes('.vscode/extensions.json'), true);
+  });
+
+  test('preexisting staged/unstaged/deleted/renamed/space-named work is baseline, not QA diff; later changes are visible', () => {
+    fs.writeFileSync(path.join(t.repo, 'staged.txt'), 's1\n'); fs.writeFileSync(path.join(t.repo, 'gone.txt'), 'g\n'); sh(t.repo, 'add', '.'); sh(t.repo, 'commit', '-qm', 'more');
+    fs.unlinkSync(path.join(t.repo, 'gone.txt')); // unstaged deletion
+    fs.writeFileSync(path.join(t.repo, 'staged.txt'), 's2\n'); sh(t.repo, 'add', 'staged.txt'); // staged
+    fs.writeFileSync(path.join(t.repo, 'staged.txt'), 's3\n'); // + further unstaged (MM)
+    fs.writeFileSync(path.join(t.repo, 'README.md'), '# Demo user edit\n'); // unstaged
+    sh(t.repo, 'mv', 'app.txt', 'moved app.txt'); // staged rename (but TEST_OK reads app.txt, restored below)
+    fs.copyFileSync(path.join(t.repo, 'moved app.txt'), path.join(t.repo, 'app.txt')); // keep tests runnable; app.txt now untracked
+    fs.writeFileSync(path.join(t.repo, 'my notes.txt'), 'untracked with space\n');
+    const indexBefore = idx();
+    const s = start({ tests: [[process.execPath, '-e', '']] });
+    assert.equal(s.code, 0, s.out + s.err);
+    const b = runJson(s.json.run).baseline;
+    const xy = Object.fromEntries(b.dirty.map((e) => [e.path, e.xy]));
+    assert.equal(xy['staged.txt'], 'MM');
+    assert.equal(xy['README.md'], ' M');
+    assert.equal(xy['my notes.txt'], '??');
+    assert.equal(xy['gone.txt'], ' D');
+    assert.equal(xy['moved app.txt'], 'R ');
+    assert.equal(b.dirty.find((e) => e.path === 'moved app.txt').orig, 'app.txt');
+    assert.notEqual(b.index_tree, b.work_tree, 'staged and on-disk states are distinct');
+    assert.equal(sh(t.repo, 'show', `${b.index_tree}:staged.txt`), 's2\n');
+    assert.equal(sh(t.repo, 'show', `${b.work_tree}:staged.txt`), 's3\n');
+    assert.equal(sh(t.repo, 'show', `${b.work_tree}:my notes.txt`), 'untracked with space\n');
+
+    cli('advance', s.json.run);
+    fs.writeFileSync(path.join(t.repo, 'later.txt'), 'new work\n');
+    fs.writeFileSync(path.join(t.repo, 'README.md'), '# Demo user edit + worker\n');
+    const r = cli('advance', s.json.run, '--done', 'task-T1');
+    assert.equal(r.json.status, 'validated', r.out);
+    const p = qaPrompt(s.json.run);
+    const diff = p.slice(p.indexOf('<diff_against_start_baseline>'));
+    assert.match(diff, /later\.txt/);
+    assert.match(diff, /\+# Demo user edit \+ worker/);
+    assert.doesNotMatch(diff, /staged\.txt|my notes|s3|moved app|gone\.txt/, 'pre-existing work is not in the QA diff');
+    assert.match(p, /<preexisting_uncommitted_state_at_start>[\s\S]*my notes\.txt/);
+    assert.match(p, /<new_untracked_files_since_start>\nlater\.txt\n<\/new_untracked_files_since_start>/);
+    assert.ok(idx().equals(indexBefore), 'real index byte-for-byte unchanged through the run');
+    assert.equal(fs.readFileSync(path.join(t.repo, 'my notes.txt'), 'utf8'), 'untracked with space\n');
+    assert.equal(fs.readFileSync(path.join(t.repo, 'staged.txt'), 'utf8'), 's3\n');
+  });
+
+  test('worker/repair actions carry the baseline summary and the preserve rule', () => {
+    fs.writeFileSync(path.join(t.repo, 'mine.txt'), 'x');
+    const id = start().json.run;
+    const a = cli('advance', id).json;
+    assert.deepEqual(a.baseline.entries, ['?? mine.txt']);
+    assert.match(a.rules, /Preserve pre-existing uncommitted edits/);
+    assert.match(fs.readFileSync(path.join(t.repo, '.git/concord/runs', id, 'prompts/proposal.a1.txt'), 'utf8'), /preexisting_uncommitted_state_at_start>\n\?\? mine\.txt/);
+    edit('wrong\n');
+    const rep = cli('advance', id, '--done', 'task-T1').json;
+    assert.equal(rep.action, 'repair');
+    assert.match(rep.rules, /Preserve pre-existing/);
+    assert.equal(rep.baseline.count, 1);
+  });
+
+  test('fast docs task validates with unrelated dirty files; fast code edits are still blocked', () => {
+    fs.mkdirSync(path.join(t.repo, '.vscode'));
+    fs.writeFileSync(path.join(t.repo, '.vscode/extensions.json'), '{}');
+    edit('user wip\n'); // tracked, non-doc, dirty BEFORE start
+    scenario(DOCS);
+    const id = start({ request: 'Fix the typo in README.md', policy: 'fast', tests: [[process.execPath, '-e', '']] }).json.run;
+    cli('advance', id);
+    fs.writeFileSync(path.join(t.repo, 'README.md'), '# Demo fixed\n');
+    const ok = cli('advance', id, '--done', 'task-D1');
+    assert.equal(ok.json.status, 'validated', ok.out);
+    assert.equal(runJson(id).steps.find((x) => x.id === 'review').status, 'skipped');
+    // post-validation change (even to a preexisting dirty file) still invalidates
+    edit('user wip 2\n');
+    assert.equal(cli('approve', id, '--decision', 'approve').json.error, 'stale_validation');
+    // ...and now the ACTUAL change is a non-doc file relative to baseline: fast gate fails closed
+    const again = cli('advance', id);
+    assert.equal(again.json.failure.fast_gate, true, again.out);
+    assert.deepEqual(again.json.failure.paths, ['app.txt']);
+    assert.equal(fs.readFileSync(path.join(t.repo, '.vscode/extensions.json'), 'utf8'), '{}');
+  });
+
+  test('fast new code edit blocked even when other work was dirty at start', () => {
+    fs.writeFileSync(path.join(t.repo, 'notes.md'), 'wip');
+    scenario(DOCS);
+    const id = start({ request: 'Fix the typo in README.md', policy: 'fast', tests: [[process.execPath, '-e', '']] }).json.run;
+    cli('advance', id);
+    edit();
+    const r = cli('advance', id, '--done', 'task-D1');
+    assert.equal(r.json.failure.fast_gate, true);
+    assert.deepEqual(r.json.failure.paths, ['app.txt']);
+  });
+
+  test('v0.2.0 persisted run (head-only clean baseline) still resumes and validates', () => {
+    const id = start().json.run;
+    const file = path.join(t.repo, '.git/concord/runs', id, 'run.json');
+    const run = JSON.parse(fs.readFileSync(file, 'utf8'));
+    run.baseline = { head: run.baseline.head, fingerprint: run.baseline.fingerprint, clean: true };
+    run.version = '0.2.0';
+    fs.writeFileSync(file, JSON.stringify(run));
+    assert.equal(cli('resume', id).json.action, 'continue');
+    const a = cli('advance', id);
+    assert.equal(a.json.step, 'task-T1');
+    assert.equal(a.json.baseline.clean, true);
+    edit();
+    assert.equal(cli('advance', id, '--done', 'task-T1').json.status, 'validated');
+    assert.match(qaPrompt(id), /diff_against_start_baseline>\n[\s\S]*\+done/);
+    assert.match(cli('status', id).out, /validated/);
+  });
+
+  test('status reports preserved baseline; strict start on untracked-only dirt still refuses', () => {
+    fs.writeFileSync(path.join(t.repo, 'u.txt'), '1');
+    const strict = start({ require_clean: true });
+    assert.equal(strict.json.error, 'dirty');
+    assert.match(strict.json.message, /\?\? u\.txt/);
+    const id = start().json.run;
+    assert.match(cli('status', id).out, /baseline: 1 pre-existing uncommitted entry preserved \(\?\? u\.txt\)/);
+    assert.equal(cli('status', id, '--json').json.baseline_state.count, 1);
+  });
+});
+
+describe('check autodiscovery (v0.2.1)', () => {
+  const pkg = (dir, obj) => { fs.mkdirSync(path.join(t.repo, dir), { recursive: true }); fs.writeFileSync(path.join(t.repo, dir, 'package.json'), JSON.stringify(obj)); };
+  const touch = (f, c = '') => { fs.mkdirSync(path.dirname(path.join(t.repo, f)), { recursive: true }); fs.writeFileSync(path.join(t.repo, f), c); };
+  const pmLog = () => { try { return fs.readFileSync(t.env.FAKE_PM_LOG, 'utf8').trim().split('\n'); } catch { return []; } };
+  const noTests = (extra = {}) => start({ tests: undefined, ...extra });
+  const qaPrompt = (id) => fs.readFileSync(path.join(t.repo, '.git/concord/runs', id, 'prompts/qa-1.a1.txt'), 'utf8');
+
+  test('npm from scripts.test + package-lock; start without spec.tests runs it via argv and validates', () => {
+    pkg('.', { name: 'x', scripts: { test: 'node t.js', lint: 'eslint .' } });
+    touch('package-lock.json', '{}');
+    const c = cli('checks', '--json').json;
+    assert.deepEqual(c.selected.argv, ['npm', 'run', 'test']);
+    assert.equal(c.selected.kind, 'test');
+    assert.match(c.selected.source, /package\.json scripts\.test \(lockfile package-lock\.json\)/);
+    const s = noTests();
+    assert.equal(s.code, 0, s.out + s.err);
+    assert.equal(s.json.checks.mode, 'auto');
+    assert.equal(s.json.checks.behavioural_tests, true);
+    const id = s.json.run;
+    cli('advance', id); edit();
+    const r = cli('advance', id, '--done', 'task-T1');
+    assert.equal(r.json.status, 'validated', r.out);
+    assert.deepEqual(runJson(id).tests, [['npm', 'run', 'test']]);
+    assert.equal(runJson(id).test_selection.script, 'test');
+    assert.equal(pmLog().length >= 1 && pmLog()[0], `npm ${t.repo} run test`);
+    assert.match(cli('status', id).out, /checks: npm run test \[auto, test\]/);
+  });
+
+  test('pnpm via packageManager/lockfile; nearest package from cwd; typecheck reported truthfully', () => {
+    pkg('.', { name: 'root', packageManager: 'pnpm@9.1.0', scripts: { test: 'vitest run' } });
+    pkg('packages/api', { name: '@x/api', scripts: { typecheck: 'tsc --noEmit', build: 'tsc' } });
+    touch('pnpm-lock.yaml'); touch('package-lock.json', '{}'); // packageManager would win at root; lock picks pnpm for api too? conflicting -> see below
+    // api has no packageManager and two lockfiles up-tree: ambiguous, so nothing is selected there; the root package takes over.
+    const amb = cliIn(path.join(t.repo, 'packages/api'), 'checks', '--json').json;
+    assert.deepEqual(amb.selected.argv, ['pnpm', 'run', 'test']);
+    assert.ok(amb.skipped.some((x) => /conflicting lockfiles/.test(x.reason)));
+    fs.unlinkSync(path.join(t.repo, 'package-lock.json'));
+    const c = cliIn(path.join(t.repo, 'packages/api'), 'checks', '--json').json;
+    assert.deepEqual(c.selected.argv, ['pnpm', 'run', 'typecheck']);
+    assert.equal(c.selected.cwd, 'packages/api');
+    assert.equal(c.selected.kind, 'typecheck');
+    assert.equal(c.behavioural_tests, false);
+    assert.deepEqual(cli('checks', '--json').json.selected.argv, ['pnpm', 'run', 'test'], 'root cwd → root package');
+    const s = cliIn(path.join(t.repo, 'packages/api'), 'start', '--spec', (() => { const f = path.join(t.root, 'spec-tc.json'); fs.writeFileSync(f, JSON.stringify({ request: 'Make app.txt say done' })); return f; })());
+    assert.equal(s.code, 0, s.out + s.err);
+    assert.equal(s.json.checks.behavioural_tests, false);
+    const id = s.json.run;
+    cli('advance', id); edit();
+    const r = cli('advance', id, '--done', 'task-T1');
+    assert.equal(r.json.status, 'validated', r.out);
+    assert.match(r.json.message, /Validation gate was typecheck: TYPECHECK ONLY/);
+    assert.equal(pmLog()[0], `pnpm ${path.join(t.repo, 'packages/api')} run typecheck`, 'runs in the package dir');
+    assert.equal(runJson(id).validation.check_kind, 'typecheck');
+    assert.match(qaPrompt(id), /NOTE \(kind=typecheck\): TYPECHECK ONLY[\s\S]*NOT evidence that behaviour was tested/);
+    assert.match(cli('status', id).out, /\[auto, typecheck — TYPECHECK ONLY/);
+  });
+
+  test('yarn/bun selection by lockfile; preference test > check > typecheck > lint > build', () => {
+    pkg('.', { scripts: { build: 'tsc', lint: 'eslint .', typecheck: 'tsc --noEmit', check: 'node check.js' } });
+    touch('yarn.lock');
+    assert.deepEqual(cli('checks', '--json').json.selected.argv, ['yarn', 'run', 'check']);
+    pkg('.', { scripts: { build: 'tsc', lint: 'eslint .' } });
+    assert.deepEqual(cli('checks', '--json').json.selected.argv, ['yarn', 'run', 'lint']);
+    fs.unlinkSync(path.join(t.repo, 'yarn.lock')); touch('bun.lockb');
+    const bun = cli('checks', '--json').json; // bun is not on PATH in the sandbox → not selected, reason recorded
+    assert.equal(bun.selected, null);
+    assert.ok(bun.skipped.some((x) => /bun is not on PATH/.test(x.reason)));
+  });
+
+  test('placeholder / watch / missing scripts fall through; nothing reliable → ask, never a false pass', () => {
+    pkg('.', { scripts: { test: 'echo "Error: no test specified" && exit 1', typecheck: 'tsc --watch', lint: 'echo ok' } });
+    let c = cli('checks', '--json').json;
+    assert.equal(c.selected, null);
+    assert.deepEqual(c.skipped.map((x) => x.script), ['test', 'typecheck', 'lint']);
+    assert.match(c.skipped[0].reason, /placeholder/);
+    assert.match(c.skipped[1].reason, /watch/);
+    const s = noTests();
+    assert.equal(s.code, 2);
+    assert.equal(s.json.error, 'no_tests');
+    assert.match(s.json.message, /Ask the user which command gates the run/);
+    assert.deepEqual(fs.existsSync(path.join(t.repo, '.git/concord/runs')) ? fs.readdirSync(path.join(t.repo, '.git/concord/runs')) : [], [], 'no run created');
+    pkg('.', { scripts: { test: 'jest --watchAll', build: 'tsc -p .' } });
+    c = cli('checks', '--json').json;
+    assert.deepEqual(c.selected.argv, ['npm', 'run', 'build']);
+    assert.equal(c.selected.kind, 'build');
+    assert.match(c.selected.note, /BUILD ONLY/);
+    fs.rmSync(path.join(t.repo, 'package.json'));
+    assert.equal(cli('checks', '--json').json.selected, null);
+    assert.equal(noTests().json.error, 'no_tests');
+    assert.match(cli('checks').out, /no reliable check command detected/);
+  });
+
+  test('explicit tests override autodetection; the original pnpm --filter spec stays valid; empty list still refused', () => {
+    pkg('.', { scripts: { test: 'node t.js' } });
+    const s = start({ tests: [[process.execPath, '-e', '']] });
+    assert.equal(s.json.checks.mode, 'explicit');
+    assert.deepEqual(runJson(s.json.run).tests, [[process.execPath, '-e', '']]);
+    cli('cancel', s.json.run);
+    const orig = path.join(t.root, 'orig-spec.json');
+    fs.writeFileSync(orig, '{"request": "对我这个xddq_v2项目做一下安全审计", "tests": [["pnpm", "--filter", "@xddq/api", "typecheck"]]}');
+    const o = cli('start', '--spec', orig);
+    assert.equal(o.code, 0, o.out + o.err);
+    assert.deepEqual(runJson(o.json.run).tests, [['pnpm', '--filter', '@xddq/api', 'typecheck']]);
+    cli('cancel', o.json.run);
+    assert.equal(start({ tests: [] }).json.error, 'no_tests');
+  });
+
+  test('autodetect with a dirty baseline: untracked .vscode preserved, index unchanged, QA told about baseline defects', () => {
+    touch('.vscode/extensions.json', '{"recommendations":[]}\n');
+    pkg('.', { scripts: { test: 'node t.js' } });
+    const indexBefore = fs.readFileSync(path.join(t.repo, '.git/index'));
+    const s = noTests();
+    assert.equal(s.code, 0, s.out + s.err);
+    assert.ok(s.json.baseline.entries.includes('?? .vscode/extensions.json'));
+    const id = s.json.run;
+    cli('advance', id); edit();
+    assert.equal(cli('advance', id, '--done', 'task-T1').json.status, 'validated');
+    assert.equal(fs.readFileSync(path.join(t.repo, '.vscode/extensions.json'), 'utf8'), '{"recommendations":[]}\n');
+    assert.ok(fs.readFileSync(path.join(t.repo, '.git/index')).equals(indexBefore));
+    const p = qaPrompt(id);
+    assert.match(p, /do not report unchanged pre-existing edits as defects\. EXCEPTION: .*baseline.*requested outcome/);
+    const diff = p.slice(p.indexOf('<diff_against_start_baseline>'));
+    assert.doesNotMatch(diff, /extensions\.json|package\.json/);
+  });
+
+  test('strict mode still refuses a dirty start when tests are autodetected', () => {
+    pkg('.', { scripts: { test: 'node t.js' } });
+    const r = noTests({ require_clean: true });
+    assert.equal(r.json.error, 'dirty');
+  });
+
+  test('explicit non-test commands are custom, never called behavioural tests (status, QA, await_human)', () => {
+    const orig = path.join(t.root, 'orig-spec.json');
+    fs.writeFileSync(orig, '{"request": "Make app.txt say done", "tests": [["pnpm", "--filter", "@xddq/api", "typecheck"]]}');
+    const s = cli('start', '--spec', orig);
+    assert.equal(s.json.checks.kind, 'custom');
+    assert.equal(s.json.checks.behavioural_tests, false);
+    assert.match(s.json.checks.note, /CUSTOM command/);
+    const id = s.json.run;
+    cli('advance', id); edit();
+    const r = cli('advance', id, '--done', 'task-T1');
+    assert.equal(r.json.status, 'validated', r.out);
+    assert.match(r.json.message, /Validation gate was custom: CUSTOM command/);
+    assert.match(cli('status', id).out, /\[explicit, custom — CUSTOM command/);
+    assert.equal(cli('status', id, '--json').json.checks.behavioural_tests, false);
+    assert.match(qaPrompt(id), /NOTE \(kind=custom\): CUSTOM command[\s\S]*NOT evidence/);
+    // saved run without metadata must not claim tests either
+    const file = path.join(t.repo, '.git/concord/runs', id, 'run.json');
+    const run = JSON.parse(fs.readFileSync(file, 'utf8')); delete run.test_selection; fs.writeFileSync(file, JSON.stringify(run));
+    assert.equal(cli('status', id, '--json').json.checks.kind, 'custom');
+    // only <pm> test counts as a known test script
+    cli('cancel', id);
+    assert.equal(start({ tests: [['npm', 'test']] }).json.checks.behavioural_tests, true);
+  });
+
+  test('autodetect skips --fix/--write scripts that would mutate source', () => {
+    pkg('.', { scripts: { test: 'eslint . --fix', check: 'prettier --write .', lint: 'eslint . --max-warnings=0', build: 'tsc' } });
+    const c = cli('checks', '--json').json;
+    assert.deepEqual(c.selected.argv, ['npm', 'run', 'lint']);
+    assert.deepEqual(c.skipped.map((x) => x.script), ['test', 'check']);
+    assert.match(c.skipped[0].reason, /auto-fix/);
+    pkg('.', { scripts: { lint: 'eslint . --fix' } });
+    assert.equal(cli('checks', '--json').json.selected, null);
   });
 });
