@@ -1,0 +1,13 @@
+{
+  "name": "concord-plugin",
+  "owner": { "name": "radowitz" },
+  "metadata": { "description": "Concord: Codex/Grok-reviewed native Claude Code workflow." },
+  "plugins": [
+    {
+      "name": "concord",
+      "version": "0.2.0",
+      "description": "贞观·政事堂 · Concord: native Claude Code workflow with Codex proposal/plan/QA and Grok review. No daemon, no backend; never commits, pushes or deploys.",
+      "source": "./plugins/concord"
+    }
+  ]
+}
