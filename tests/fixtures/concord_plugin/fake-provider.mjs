@@ -59,17 +59,77 @@ if (argv[0] === 'models') {
   process.exit(0);
 }
 
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+const write = (text) => fs.writeSync(1, text);
+const line = (o) => write(`${JSON.stringify(o)}\n`);
+
+if (provider === 'grok' && argv.includes('--help')) {
+  // Same shape as the real CLI's help; FAKE_GROK_FORMATS lets tests simulate an older CLI without streaming-json.
+  const formats = process.env.FAKE_GROK_FORMATS || 'plain, json, streaming-json, streaming-messages-json';
+  process.stdout.write(`Grok Build TUI\n\nOptions:\n      --output-format <OUTPUT_FORMAT>\n          Output format for headless mode [default: plain] [possible values: ${formats}]\n`);
+  process.exit(0);
+}
+
 const prompt = provider === 'codex' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(arg('--prompt-file'), 'utf8');
 const id = prompt.match(/technical id: ([a-z_]+)/)?.[1];
 const role = prompt.includes('Fast policy') ? 'proposal_plan' : id;
 log({ provider, role, argv, cwd: process.cwd() });
 const r = next(role);
 
+// Optional scenario controls: $silent_ms (no output at first), $hold_ms (pause after the first event so a
+// reader can observe a live log), $mode (grok stream shape), $pieces (raw stdout writes), $delay_ms.
+if (r?.$silent_ms) await sleep(r.$silent_ms);
 if (r?.$hang) hang();
 else if (r?.$exit !== undefined) { process.stderr.write('fake failure\n'); process.exit(r.$exit); }
 else {
   if (r?.$touch) fs.appendFileSync(path.join(arg('-C') ?? process.cwd(), r.$touch), 'x');
   const body = r?.$raw ?? JSON.stringify(r?.$touch ? DEFAULTS[role] : r);
-  if (provider === 'codex') fs.writeFileSync(arg('-o'), body);
-  else process.stdout.write(JSON.stringify({ text: body }));
+  const hold = async () => { if (r?.$hold_ms) await sleep(r.$hold_ms); };
+  if (r?.$pieces) {
+    for (const p of r.$pieces) { fs.writeSync(1, typeof p === 'string' ? Buffer.from(p) : Buffer.from(p.hex, 'hex')); await sleep(r.$delay_ms ?? 30); }
+    if (provider === 'codex' && !r.$no_last) fs.writeFileSync(arg('-o'), body);
+  } else if (provider === 'codex') {
+    if (argv.includes('--json')) {
+      line({ type: 'thread.started', thread_id: 't-fake' });
+      line({ type: 'turn.started' });
+      line({ type: 'item.started', item: { id: 'i1', type: 'reasoning' } });
+      await hold();
+      line({ type: 'item.completed', item: { id: 'i2', type: 'agent_message', text: body } });
+      // $mode: error = unrecovered trailing error; turn_failed = terminal turn.failed; truncated = no terminal event;
+      // recovered = a transient error followed by a successful turn.completed.
+      if (r?.$mode === 'error') line({ type: 'error', message: 'codex stream failure' });
+      else if (r?.$mode === 'turn_failed') line({ type: 'turn.failed', error: { message: 'codex turn failed hard' } });
+      else if (r?.$mode === 'truncated') { /* stream just stops */ }
+      else {
+        if (r?.$mode === 'recovered') line({ type: 'error', message: 'transient reconnect' });
+        line({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } });
+      }
+    }
+    if (r?.$mode !== 'no_last') fs.writeFileSync(arg('-o'), body);
+  } else {
+    const fmtName = arg('--output-format');
+    if (fmtName === 'streaming-json' && r?.$mode !== 'legacy') {
+      line({ type: 'x.ai/session', phase: 'started' });
+      line({ type: 'thought', data: 'SECRET-INTERNAL-THOUGHT' });
+      await hold();
+      const third = Math.ceil(body.length / 3);
+      const chunks = [body.slice(0, third), body.slice(third, 2 * third), body.slice(2 * third)];
+      if (r?.$mode === 'malformed_final') chunks.splice(0, chunks.length, 'this is {not valid json');
+      for (const [i, c] of chunks.entries()) {
+        const l = `${JSON.stringify({ type: 'text', data: c })}\n`;
+        if (r?.$split_bytes && i === 0) {
+          const buf = Buffer.from(l); const cut = buf.indexOf(0xe5) >= 0 ? buf.indexOf(0xe5) + 1 : Math.floor(buf.length / 2);
+          fs.writeSync(1, buf.subarray(0, cut)); await sleep(60); fs.writeSync(1, buf.subarray(cut));
+        } else write(l);
+        await sleep(r?.$delay_ms ?? 5);
+      }
+      line({ type: 'tool_call', title: 'noop', kind: 'other', status: 'completed' });
+      line({ type: 'usage', input_tokens: 3, output_tokens: 4 });
+      if (r?.$mode === 'error') line({ type: 'error', message: 'grok stream failure' });
+      else if (r?.$mode !== 'no_end') line({ type: 'end', sessionId: 'fake-session' });
+    } else if (fmtName === 'streaming-json' || fmtName === 'json') {
+      await hold();
+      process.stdout.write(JSON.stringify({ text: body }));
+    } else process.stdout.write(body);
+  }
 }

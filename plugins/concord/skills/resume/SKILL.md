@@ -15,11 +15,15 @@ disable-model-invocation: true
 2. Report the result: the interrupted steps, any `failure`, and the next action.
 3. Next:
    - `failed` or interrupted: only if the user typed `--retry` or confirms, run
-     `H advance <run-id> --retry` with Bash `timeout: 600000`. This re-runs exactly the failed step.
+     `H advance <run-id> --retry --one-step` as a background Bash task (see
+     `${CLAUDE_PLUGIN_ROOT}/skills/run/SKILL.md`, helper stages). This re-runs exactly the failed step.
+     A `failure.kind` of `timeout` was a helper time limit, not a verdict: mention `limits.review_timeout_s` / `extend`.
      If they don't, stop.
    - `implement`, `repair` or `continue`: carry on with the loop in section 2 of
      `${CLAUDE_PLUGIN_ROOT}/skills/run/SKILL.md`. Read it first if it isn't already in context.
    - `await_human` or `none`: summarise with `H status <run-id>` and stop.
+
+If the helper answers `wrong_worktree`, rerun with the `--repo` it prints.
 
 Before you re-do an `implement` step, check the working tree. A previous session may have
 partly finished it. Never stash, reset or discard files to get a clean state; pre-existing uncommitted work in `baseline` belongs to the user.

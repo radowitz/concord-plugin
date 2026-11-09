@@ -10,7 +10,7 @@ export const RUN_ID = /^[0-9]{8}-[0-9]{6}-[a-f0-9]{6}$/;
 export const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
 
 export class ConcordError extends Error {
-  constructor(message, code = 'error') { super(message); this.code = code; }
+  constructor(message, code = 'error', details = undefined) { super(message); this.code = code; if (details) this.details = details; }
 }
 
 /** Resolve the repository top level and the state root (in git internals, never tracked). */
@@ -77,7 +77,7 @@ export function acquireLock(loc, runId) {
       let owner = null;
       try { owner = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* torn */ }
       if (owner && owner.host === os.hostname() && alive(owner.pid)) {
-        throw new ConcordError(`another Concord helper (pid ${owner.pid}, run ${owner.run}) holds ${file}`, 'locked');
+        throw new ConcordError(`another Concord helper (pid ${owner.pid}, run ${owner.run}) holds ${file}; do not start a duplicate: follow it with \`logs\`/\`status --light\`, or \`cancel\` it`, 'locked', { helper_pid: owner.pid, helper_run: owner.run });
       }
       stale = owner;
       try { fs.unlinkSync(file); } catch { /* raced */ }

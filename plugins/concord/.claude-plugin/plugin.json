@@ -1,6 +1,6 @@
 {
   "name": "concord",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "贞观·政事堂 · Concord (Concord V3) native workflow: Codex proposal → Grok review → Codex task plan → implementation by this Claude Code session/subagents → real tests → read-only Codex QA → bounded repair. Node builtins only; no daemon, no backend. Never commits, pushes or deploys; the human decides.",
   "author": { "name": "radowitz" },
   "homepage": "https://github.com/radowitz/concord-plugin",
