@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PLUGIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const ASSETS = ['.claude-plugin/plugin.json', 'README.md', 'skills', 'scripts/concord.mjs', 'scripts/lib'];
+const ASSETS = ['.claude-plugin/plugin.json', 'README.md', 'README.zh-CN.md', 'skills', 'agents', 'policy', 'scripts/concord.mjs', 'scripts/lib'];
 
 const i = process.argv.indexOf('--out');
 if (i < 0 || !process.argv[i + 1]) {

@@ -53,7 +53,7 @@ function sandbox() {
     fs.writeFileSync(path.join(bin, p), `#!/bin/sh\necho "${p} $PWD $*" >> "$FAKE_PM_LOG"\nexit "\${FAKE_PM_EXIT:-0}"\n`, { mode: 0o755 });
   }
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_PM_LOG: path.join(root, 'pm.log'), CONCORD_CODEX_BIN: path.join(bin, 'codex'), CONCORD_GROK_BIN: path.join(bin, 'grok'),
-    CONCORD_CACHE_DIR: path.join(root, 'cache'), FAKE_CALLS: path.join(root, 'calls.jsonl'), FAKE_SCENARIO: path.join(root, 'scenario.json') };
+    CONCORD_CACHE_DIR: path.join(root, 'cache'), CONCORD_MODEL_DISCOVERY: 'off', FAKE_CALLS: path.join(root, 'calls.jsonl'), FAKE_SCENARIO: path.join(root, 'scenario.json') };
   delete env.CONCORD_STATE_DIR;
   return { root, repo, env };
 }
@@ -113,7 +113,7 @@ describe('local commands', () => {
     assert.deepEqual(r.json.providers.grok.models, ['grok-test-a', 'grok-test-b']);
     assert.match(r.json.providers.codex.source, /codex debug models/);
     assert.ok(Date.parse(r.json.providers.grok.observed_at));
-    assert.deepEqual(r.json.providers.claude.models, ['haiku', 'sonnet', 'opus']);
+    assert.deepEqual(r.json.providers.claude.models, ['haiku', 'sonnet', 'opus', 'fable']);
     assert.equal(r.json.providers.claude.status, 'aliases');
     // Overrides must be account-listed once a list is cached; account_default always allowed.
     const bad = start({ models: { qa: 'gpt-made-up' } });
@@ -450,9 +450,9 @@ describe('packaging', () => {
     assert.ok(files.includes('concord/skills/run/SKILL.md'));
     assert.ok(files.every((f) => !/\.py$|agentflow|tests?\//.test(f)), files.join('\n'));
     const manifest = JSON.parse(fs.readFileSync(path.join(out, 'concord/.claude-plugin/plugin.json'), 'utf8'));
-    assert.equal(manifest.version, '0.2.2');
+    assert.equal(manifest.version, '0.3.0');
     // Packaged helper runs standalone.
-    assert.equal(spawnSync(process.execPath, [path.join(out, 'concord/scripts/concord.mjs'), '--version'], { encoding: 'utf8' }).stdout.trim(), '0.2.2');
+    assert.equal(spawnSync(process.execPath, [path.join(out, 'concord/scripts/concord.mjs'), '--version'], { encoding: 'utf8' }).stdout.trim(), '0.3.0');
   });
 });
 
@@ -1527,7 +1527,12 @@ describe('check coverage and repair routing (v0.2.2)', () => {
       cli('advance', id); edit();
       const rep = cli('advance', id, '--done', 'task-T1');
       assert.equal(rep.json.action, 'repair', rep.out);
-      assert.equal(rep.json.agent.model, want, `${JSON.stringify(plan.plan[0].tasks[0].risk)} override=${over}`);
+      // The capability tier is unchanged; what is REQUESTED for the opus tier is now the user's Fable 5.2/high
+      // preference through the packaged agent (no model parameter), with Opus 5.5/xhigh as the declared fallback.
+      if (want === 'opus') {
+        assert.deepEqual(rep.json.agent, { subagent_type: 'concord:fable-worker' }, 'pinned agent: no model override');
+        assert.equal(rep.json.fallback.candidate, 'opus-5.5-xhigh');
+      } else assert.equal(rep.json.agent.model, want, `${JSON.stringify(plan.plan[0].tasks[0].risk)} override=${over}`);
       assert.equal(rep.json.tier, want);
       if (!over && want === 'opus') assert.match(rep.json.tier_reason, /inherits opus from task T1/);
       cli('cancel', id); edit('todo\n');
@@ -1540,7 +1545,9 @@ describe('check coverage and repair routing (v0.2.2)', () => {
     const a = cli('advance', id);
     assert.equal(a.json.tier, 'haiku');
     edit();
-    assert.equal(cli('advance', id, '--done', 'task-T1').json.agent.model, 'opus', 'repair is routed by task risk, not by the worker override');
+    const rep = cli('advance', id, '--done', 'task-T1').json;
+    assert.equal(rep.tier, 'opus', 'repair is routed by task risk, not by the worker override');
+    assert.equal(rep.route.candidate, 'fable-5.2-high');
   });
 });
 

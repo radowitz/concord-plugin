@@ -22,7 +22,8 @@ Never paste `$ARGUMENTS` into the shell.
 | live or finished step logs | the `logs` skill: `H logs <run-id> [--step <id>]` |
 | all runs in this repo | `H list` |
 | one stored artifact | `H show <run-id> <artifact>` |
-| model cache (no network) | `H models` |
+| model cache, Claude routing policy, candidates (no network) | `H models` |
+| advisory outcome ledger | `H models --observations` |
 | free local preflight | `H preflight` |
 
 Summarise in a few lines:
@@ -30,6 +31,7 @@ Summarise in a few lines:
 - the status, phase and any failing step with its error
 - the 政事堂议事 artifacts this run actually produced; say plainly when one is missing, and never fill gaps with invented content
 - the next action
+- routing: each task's capability tier and the *requested* candidate (`routing`, `tasks[].route`), any fallback switch (`routing.route_events`), and that the actual model is not observed
 - revision and amendments, the check's `cwd`, any check-coverage warning, and per-stage time if the user asks
 - for a running stage: step, elapsed vs limit, last output / no output yet (from `--light`)
 - if `worktree.foreign` is true the run belongs to another worktree: this is a read-only view, the working state is "unavailable" (not "invalid"), and mutating commands need `--repo <run repo>`

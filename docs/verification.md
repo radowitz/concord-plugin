@@ -1,6 +1,28 @@
-# Verification evidence (v0.2.2)
+# Verification evidence
 
 **English** · [中文](#中文)
+
+## v0.3.0 local upgrade (2026-11-12, not tagged or published)
+
+What was actually run for the model-routing upgrade. Everything below the next heading is the unchanged v0.2.2 evidence.
+
+| # | Evidence | Result |
+|---|---|---|
+| 1 | Both native suites, `node --test tests/*.test.mjs` (`claude_plugin.test.mjs` + `model-routing.test.mjs`): fake Codex/Grok CLIs, offline docs fixture and injected fetches, temporary git repositories, no network, no real models | 124 tests passed, 0 failed (93 + 31) |
+| 2 | `claude plugin validate` on the source plugin, the source marketplace manifest, and a package built with `scripts/package.mjs` | passed (only the optional missing-icon notice) |
+| 3 | Package contents built with `scripts/package.mjs` | contains `agents/fable-worker.md`, `agents/opus-worker.md`, `policy/routing.sample.json`, `README.md`, `README.zh-CN.md`, `scripts/lib/routing.mjs`, `scripts/lib/discovery.mjs`; packaged helper reports `0.3.0` |
+| 4 | One real bounded fetch of the official model-config page through the discovery code (during development, before the final review fixes) | succeeded in about 1.2 s; aliases `fable`, `sonnet`, `opus`, `haiku` parsed |
+| 5 | Read-only native Agent canary on Claude Code 2.1.322, using `concord:fable-worker` without per-call model or effort overrides | returned `CONCORD_FABLE_CANARY_OK`; one Agent completed, no permission denials or substitution warnings; CLI usage reported `claude-fable-5-2`. Agent frontmatter requests `high`; actual effort was not independently observed |
+| 6 | Local marketplace update through Claude Code, followed by installed-helper verification | upgraded user-scope `concord@concord-local` from 0.2.2 to 0.3.0; installed helper reports 0.3.0 and the Fable/high default with Opus/xhigh backup; restart required |
+
+Not verified for v0.3.0:
+
+- The Fable canary verifies native agent registration and a minimal response on this machine; it is not an end-to-end coding test. The Opus backup and a real model-unavailability fallback have not been exercised. Per-run helpers still do not observe the actual native model or effort.
+- No real Codex/Grok end-to-end workflow was repeated for this upgrade.
+- The outcome ledger and the advisory comparison were tested with helper-driven and synthetic runs only; no real timing data exists yet.
+- The main-session restriction is a skill instruction plus an advisory `main_session` field; it is not enforced by the helper and was not observed in a live session.
+
+## v0.2.2 (historical, unchanged)
 
 Summary of what was actually run. No raw logs, account identifiers, tokens or machine-specific paths are included. Each item is separate evidence; none of them alone proves the others.
 
@@ -31,6 +53,23 @@ Summary of what was actually run. No raw logs, account identifiers, tokens or ma
 ---
 
 ## 中文
+
+### v0.3.0 本地升级（2026-11-12，尚未打标签或发布）
+
+以下为模型路由升级实际运行过的证据；其后的 v0.2.2 记录保持原样。
+
+| # | 证据 | 结果 |
+|---|---|---|
+| 1 | 两套原生测试 `node --test tests/*.test.mjs`（`claude_plugin.test.mjs` + `model-routing.test.mjs`）：模拟 Codex/Grok、离线文档样本与注入的获取函数、临时仓库，无网络、无真实模型 | 124 个测试通过，0 个失败（93 + 31） |
+| 2 | `claude plugin validate`（源码插件、源码 marketplace 清单、`scripts/package.mjs` 构建的安装包） | 通过（仅有可选图标提示） |
+| 3 | `scripts/package.mjs` 构建的安装包内容 | 包含 `agents/fable-worker.md`、`agents/opus-worker.md`、`policy/routing.sample.json`、`README.md`、`README.zh-CN.md`、`scripts/lib/routing.mjs`、`scripts/lib/discovery.mjs`；打包后的助手报告版本 `0.3.0` |
+| 4 | 通过发现代码对官方 model-config 页面做了一次真实的有界获取（开发期间，最终评审修复之前） | 约 1.2 秒成功；解析出别名 `fable`、`sonnet`、`opus`、`haiku` |
+| 5 | Claude Code 2.1.322 上的只读原生 Agent 冒烟测试：调用 `concord:fable-worker`，不传覆盖模型或 effort 的参数 | 返回 `CONCORD_FABLE_CANARY_OK`；一个 Agent 完成，无权限拒绝或模型替换提示，CLI 用量报告包含 `claude-fable-5-2`。代理定义请求 `high`，实际 effort 未被独立观测 |
+| 6 | 通过 Claude Code 更新本地 marketplace，并检查已安装的助手 | 用户级 `concord@concord-local` 从 0.2.2 升至 0.3.0；已安装助手报告 0.3.0，默认 Fable/high、备选 Opus/xhigh；重启后生效 |
+
+**v0.3.0 未验证：** Fable 冒烟测试仅证明本机的原生代理注册与最小响应，不是完整编码流程验证；Opus 备选和真实模型不可用时的回退尚未验证。日常任务助手仍无法观测实际使用的原生模型和 effort。本次升级没有重复真实 Codex/Grok 端到端工作流。结果记录与参考性比较只用助手驱动和合成的任务测试过，尚无真实计时数据。主会话限制是技能说明加上参考性的 `main_session` 字段，助手不强制，也未在真实会话中观察。
+
+### v0.2.2（历史记录，未改动）
 
 以下只记录实际运行过的证据，不含原始日志、账号标识、令牌或本机路径。各项证据相互独立，不能互相替代。
 

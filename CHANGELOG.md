@@ -9,6 +9,22 @@ Versions below correspond to published Git tags. Documentation-only changes on `
 - Separate English and Chinese READMEs, with English as the default.
 - Add architecture roles, failure/recovery and approval explanations, and versioned changelogs.
 
+## 0.3.0 (unreleased)
+
+Source and local installation version; no Git tag or GitHub Release yet.
+
+- Capability tiers (`haiku`/`sonnet`/`opus`) are now separate from the requested model. Hard work requests Fable 5.2 at high effort by default, with Opus 5.5 at xhigh effort as the declared fallback (user policy, not a benchmark). Low and normal work still request the `haiku` and `sonnet` aliases.
+- Packaged agents `concord:fable-worker` and `concord:opus-worker` pin the full model ID and effort; they are called without a `model` parameter. `--tier` accepts `haiku|sonnet|opus|fable` or a profile candidate key; full model IDs are rejected.
+- Explicit, recorded fallback: `advance --use-fallback <step> --note-file <error>`. No silent substitution.
+- Local routing profile: `models --routing FILE`, `models --reset-routing`. Policy and published-alias snapshot are frozen into each run; older runs keep their previous routing.
+- Advisory discovery of published Claude aliases from the official model-config page (bounded HTTPS at an admitted `start` with a missing/day-old cache, or `models --refresh`; last-good cache, backoff, `CONCORD_MODEL_DISCOVERY=off`). `preflight`, `status` and `advance` stay network-free.
+- Advisory outcome ledger from approved clean native runs (`models --observations`, `models --reset-observations`); it never changes routing.
+- New test file `tests/model-routing.test.mjs`; run everything with `node --test tests/*.test.mjs`.
+- Outcome comparison is bound to the exact requested configuration (kind, alias, agent type, pinned model, effort); samples recorded for a candidate key that now means something else are excluded and counted.
+- `advance` rejects combining `--done`, `--failed` and `--use-fallback` before any change.
+- Main-session execution is limited by the skill to tiny low-tier tasks on a policy alias (`main_session.allowed` in the action); packaged agents, overrides, fallbacks, harder tiers and repairs always use the requested agent.
+- Verification: see `docs/verification.md` (124 offline tests and a successful read-only native Fable worker canary; full native coding and real fallback remain unverified).
+
 ## [0.2.2](https://github.com/radowitz/concord-plugin/releases/tag/v0.2.2)
 
 ### Added

@@ -16,10 +16,12 @@ import {
 import {
   CLAUDE_TIERS, DOCS, RISK, TTL_S, cachePath, catalogAge, loadCatalog, refreshCatalog, resolveExternal, routeTask,
 } from './lib/models.mjs';
+import { OFFICIAL_URL, TTL_MS, discoveryFile, ensureDiscovery, loadDiscovery } from './lib/discovery.mjs';
+import * as R from './lib/routing.mjs';
 import * as W from './lib/workflow.mjs';
 import { KIND_NOTE, classifyExplicit, discoverChecks } from './lib/checks.mjs';
 
-const VERSION = '0.2.2';
+const VERSION = '0.3.0';
 const SELF = fileURLToPath(import.meta.url);
 const OPEN = new Set(['active', 'awaiting_session', 'failed', 'validated']);
 const LIMITS = { cli_timeout_s: [480, 30, 3600], test_timeout_s: [300, 10, 3600], max_repairs: [2, 0, 5] };
@@ -43,8 +45,14 @@ Commands (all short-lived; no daemon; state in <git-dir>/concord/runs/<id>):
                                       warning (pre-existing work is recorded as the run baseline);
                                       --require-clean makes it a failure.
                                       Runs no model CLI, no inference, no networking.
-  models [--refresh] [--json]         Show cached model catalog. --refresh asks local CLIs
-                                      (codex debug models, grok models) for account-listed models.
+  models [--refresh] [--json]         Show cached model catalog, the Claude routing policy and candidate
+                                      state. --refresh asks local CLIs (codex debug models, grok models)
+                                      for account-listed models and re-reads the published Claude alias
+                                      list (one bounded HTTPS GET of the official model-config page).
+  models --routing FILE               Validate and store a local routing profile (per user, cache dir).
+  models --reset-routing              Remove the stored profile: back to the built-in default routing.
+  models --observations [--json]      Advisory outcome ledger and per-cohort comparison (never auto-applied).
+  models --reset-observations         Delete the outcome ledger.
   checks [--repo P] [--json]          Show the check command Concord would autodetect from package.json
                                       (nearest package from the cwd; scripts/packageManager/lockfiles).
   logs RUN [--step ID] [--attempt N] [--command N] [--stream stdout|stderr|events]
@@ -56,8 +64,14 @@ Commands (all short-lived; no daemon; state in <git-dir>/concord/runs/<id>):
                                       step's start; 0 = no helper deadline) - picked up by a live helper.
   start --spec FILE [--repo P]        Create a run from a JSON spec. A dirty checkout is allowed: its exact
                                       state is snapshotted as the baseline (spec require_clean:true refuses).
+                                      Once the run is admitted, a missing/day-old published Claude alias list
+                                      is refreshed (≤ 3 s, ≤ 512 KiB, official URL only; advisory; failure keeps
+                                      the cache) and the routing policy is frozen into the run.
   advance RUN [--done STEP --revision N [--executor subagent|main] [--note-file F]]
               [--failed STEP --revision N --note-file F] [--retry] [--budget S] [--one-step]
+              [--use-fallback STEP --revision N --note-file F]
+                                      (--use-fallback: switch the pending native step to its declared fallback
+                                      model after the host refused the primary; the note is the exact error.)
                                       Execute helper-owned steps (Codex/Grok/tests/QA) until the
                                       session must act; prints the next action as JSON on stdout and
                                       progress/heartbeat lines on stderr. --one-step runs exactly one
@@ -86,12 +100,13 @@ Spec (JSON): {"request": str, "tests" (optional; autodetected when omitted): [["
   "tests_cwd" (optional, explicit tests only): repo-relative dir the tests run in (default: the directory
   start was invoked from),
   "policy": "full"|"fast", "models": {"proposal","review","plan","qa": id|"account_default",
-  "worker","repair": "haiku"|"sonnet"|"opus"}, "limits": {"cli_timeout_s","test_timeout_s","max_repairs",
+  "worker","repair": "haiku"|"sonnet"|"opus"|"fable" or a routing-profile candidate key}, "limits": {"cli_timeout_s","test_timeout_s","max_repairs",
   "review_timeout_s" (default 1800; 0 = manual, no deadline), "role_timeout_s": {"proposal|review|plan|qa": s}},
   "require_clean": false}
 Test strings are split into argv (simple quotes only); shell operators are rejected. No shell is used.
 
 Env: CONCORD_CODEX_BIN, CONCORD_GROK_BIN (CLI paths), CONCORD_STATE_DIR, CONCORD_CACHE_DIR,
+     CONCORD_MODEL_DISCOVERY=off (never fetch the published Claude alias list; cache/defaults only),
      CONCORD_HEARTBEAT_MS (soft progress notice interval, default 30000; never stops a process).
 ${W.METAPHOR}`;
 
@@ -99,7 +114,7 @@ ${W.METAPHOR}`;
 
 function parseArgs(argv) {
   const pos = []; const opt = {};
-  const flags = new Set(['--json', '--refresh', '--retry', '--help', '-h', '--version', '--require-clean', '--light', '--one-step', '--writer-stopped']);
+  const flags = new Set(['--json', '--refresh', '--retry', '--help', '-h', '--version', '--require-clean', '--light', '--one-step', '--writer-stopped', '--reset-routing', '--observations', '--reset-observations']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (flags.has(a)) opt[a.replace(/^-+/, '')] = true;
@@ -151,7 +166,8 @@ function validateSpec(spec) {
   if (!['full', 'fast'].includes(policy)) throw new ConcordError('spec.policy must be full or fast', 'spec');
   const m = spec.models ?? {};
   for (const k of Object.keys(m)) if (!(k in EXTERNAL) && k !== 'worker' && k !== 'repair') throw new ConcordError(`unknown models key: ${k}`, 'spec');
-  for (const k of ['worker', 'repair']) if (m[k] !== undefined && !CLAUDE_TIERS.includes(m[k])) throw new ConcordError(`models.${k} must be one of ${CLAUDE_TIERS.join('|')}`, 'spec');
+  // Shape only here; start checks the token against the active routing policy (no free model strings).
+  for (const k of ['worker', 'repair']) if (m[k] !== undefined && (typeof m[k] !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,47}$/.test(m[k]))) throw new ConcordError(`models.${k} must be haiku|sonnet|opus|fable or a routing-profile candidate key`, 'spec');
   const limits = {};
   for (const [k, [def, lo, hi]] of Object.entries(LIMITS)) {
     const v = spec.limits?.[k] ?? def;
@@ -432,9 +448,16 @@ function accept(store, res, validate, artifactName) {
 
 function setTasks(store, tasks) {
   const ov = store.run.models.worker_override;
+  const rt = store.run.routing;
   store.run.tasks = tasks.map((t) => {
-    const { tier, reason } = routeTask(t, ov);
-    return { ...t, status: 'pending', tier, tier_reason: reason };
+    // Runs saved before routing snapshots existed keep the old alias-per-tier behaviour.
+    if (!rt) { const { tier, reason } = routeTask(t, ov); return { ...t, status: 'pending', tier, tier_reason: reason }; }
+    const computed = routeTask(t, null);
+    if (ov) {
+      const o = R.routeForOverride(rt, ov, 'worker');
+      return { ...t, status: 'pending', tier: o.tier, tier_reason: 'per-role override', computed_tier: computed.tier, route: o.route };
+    }
+    return { ...t, status: 'pending', tier: computed.tier, tier_reason: computed.reason, computed_tier: computed.tier, route: R.routeForTier(rt, computed.tier) };
   });
   // Conservative: compare planned files with the directory the check runs in; never claims coverage it cannot show.
   const cov = checkCoverage(store.loc.repo, store.run.tasks.flatMap((t) => t.files), store.run.test_selection, store.run.tasks.map((t) => t.id));
@@ -659,7 +682,14 @@ function cmdFor(store, ...args) {
  * A repair override from the spec always wins.
  */
 function repairRoute(r) {
-  if (r.models.repair_override) return { tier: r.models.repair_override, reason: 'per-role override' };
+  const rt = r.routing;
+  const id = `repair-${r.repairs_used + 1}`;
+  if (rt && r.repair_switch?.step === id) return { tier: r.repair_switch.tier, reason: r.repair_switch.reason, route: r.repair_switch.route };
+  if (r.models.repair_override) {
+    if (!rt) return { tier: r.models.repair_override, reason: 'per-role override' };
+    const o = R.routeForOverride(rt, r.models.repair_override, 'repair');
+    return { tier: o.tier, reason: 'per-role override', route: o.route };
+  }
   const files = new Set((r.repair_cause?.findings ?? []).map((f) => f.file).filter(Boolean));
   let pool = r.tasks;
   if (files.size) { const hit = r.tasks.filter((t) => t.files.some((f) => files.has(f))); if (hit.length) pool = hit; }
@@ -669,7 +699,40 @@ function repairRoute(r) {
     const rank = CLAUDE_TIERS.indexOf(tier);
     if (rank > best.rank) best = { tier, reason: `inherits ${tier} from task ${t.id} (${reason})`, rank };
   }
-  return { tier: best.tier, reason: best.reason };
+  return { tier: best.tier, reason: best.reason, ...(rt ? { route: R.routeForTier(rt, best.tier) } : {}) };
+}
+
+/**
+ * Agent-tool call + truthful routing facts for a native step. Legacy runs (no frozen routing) pass the
+ * tier alias as before. A packaged agent pins its model in frontmatter, so NO `model` is passed for it.
+ */
+function nativeCall(store, step, tier, route) {
+  if (!route) return { agent: { subagent_type: 'general-purpose', model: tier } };
+  const r = store.run; const rt = r.routing;
+  // Guidance for the session, not enforcement: the helper cannot see who edits. Doing a step in the main
+  // session bypasses the requested model, so it is only acceptable where no model preference is at stake.
+  const mainOk = step.startsWith('task-') && tier === 'haiku' && route.source === 'policy' && route.kind === 'alias';
+  const fb = route.fallback ? rt.policy.candidates[route.fallback] : null;
+  return {
+    agent: R.agentCall(route),
+    main_session: { allowed: mainOk, note: mainOk
+      ? 'Tiny low-tier step on a policy-selected alias: the session may do it itself and report --executor main (recorded as inherited/unknown).'
+      : 'Use the Agent call above. Doing this step in the main session would bypass the requested model (packaged agent, explicit override, fallback, a normal/hard-tier task, or a repair).' },
+    agent_note: route.kind === 'agent'
+      ? `Call the Agent tool with subagent_type "${route.subagent_type}" and NO model parameter: the packaged agent pins ${route.pinned_model} at effort ${route.effort}, and a model parameter would override that pin.`
+      : `Call the Agent tool with subagent_type "general-purpose" and model "${route.model}" (an alias; Claude Code resolves the version).`,
+    route: { capability_tier: tier, candidate: route.candidate, requested: route.label, kind: route.kind, alias: route.model, pinned_model: route.pinned_model, effort: route.effort,
+      source: route.source, reason: route.reason, ...(route.fallback_used ? { fallback_used: true, primary: route.primary, fallback_reason: route.fallback_reason } : {}),
+      readiness: R.readiness(rt.policy.candidates[route.candidate], rt.catalog), actual: 'not observed by the helper',
+      policy: { name: rt.policy.name, source: rt.policy.source, frozen_at: rt.frozen_at }, published_docs: { source: rt.catalog.source, fetched_at: rt.catalog.fetched_at }, caveat: rt.caveat },
+    fallback: fb
+      ? { available: true, candidate: route.fallback, requested: R.candidateLabel(fb),
+        when: 'Only after the Agent call itself was refused or could not start with the requested model/effort/agent (unavailable, denied, unsupported by this Claude Code version). Never for failing code, tests or QA. Report the exact error to the user first.',
+        switch: cmdFor(store, 'advance', r.id, '--use-fallback', step, '--revision', String(W.revisionOf(r)), '--note-file', '<file with the exact host error>', '--one-step') }
+      : { available: false, note: route.source === 'override'
+        ? 'Explicit override: no fallback. If the host cannot run it, report the exact error, record --failed, and start a new run with another --tier value.'
+        : route.fallback_used ? 'Already on the declared fallback. If it also cannot run, report the exact error and record --failed.' : 'No fallback declared for this tier. If the host cannot run it, report the exact error and record --failed.' },
+  };
 }
 
 /** What `advance` will run next (helper-owned stage), with the limit and a suggested background-Bash setup. */
@@ -708,8 +771,8 @@ function nextAction(store) {
     const t = r.tasks.find((x) => x.status !== 'done' && x.depends_on.every((d) => done.has(d)));
     const id = `task-${t.id}`;
     const rev = W.revisionOf(r);
-    return { ...base, action: 'implement', step: id, task: t, tier: t.tier, tier_reason: t.tier_reason,
-      agent: { subagent_type: 'general-purpose', model: t.tier },
+    return { ...base, action: 'implement', step: id, task: (({ route: _route, ...rest }) => rest)(t), tier: t.tier, tier_reason: t.tier_reason,
+      ...nativeCall(store, id, t.tier, t.route),
       revision: rev, request: W.effectiveRequest(r), amendments: W.amendmentsOf(r),
       ...(r.check_coverage?.status === 'warning' ? { check_coverage: r.check_coverage, coverage_note: 'Tell the user about this coverage warning before/while implementing. Do not add checks or ask new questions because of it.' } : {}),
       rules: `Edit only what this task needs in the current checkout. Do not commit, stash, reset, push or run destructive git commands. ${W.PRESERVE_RULE} Do not run the configured tests as a substitute for Concord validation. Work to the effective request (revision ${rev}), including every amendment.`,
@@ -723,7 +786,7 @@ function nextAction(store) {
     const rev = W.revisionOf(r);
     const route = repairRoute(r);
     return { ...base, action: 'repair', step: id, round: r.repairs_used + 1, max_rounds: r.limits.max_repairs, cause: r.repair_cause,
-      agent: { subagent_type: 'general-purpose', model: route.tier }, tier: route.tier, tier_reason: route.reason,
+      ...nativeCall(store, id, route.tier, route.route), tier: route.tier, tier_reason: route.reason,
       revision: rev, request: W.effectiveRequest(r), amendments: W.amendmentsOf(r),
       rules: `Fix only the reported failures/findings in the current checkout. Do not commit, stash, reset or push. ${W.PRESERVE_RULE} Work to the effective request (revision ${rev}), including every amendment.`,
       baseline: W.summarizeBaseline(r.baseline),
@@ -826,9 +889,16 @@ async function cmdStart(loc, opt) {
   for (const [role, provider] of Object.entries(EXTERNAL)) {
     try { models[role] = resolveExternal(provider, spec.models[role], catalog); } catch (e) { throw new ConcordError(e.message, 'model'); }
   }
+  // Local files only: the active routing policy, and every override token checked against it.
+  let routePolicy;
+  try { routePolicy = R.loadPolicy({ discovered: (loadDiscovery()?.aliases ?? []).map((a) => a.alias) }); } catch (e) { throw new ConcordError(e.message, 'routing_policy'); }
+  for (const k of ['worker', 'repair']) {
+    if (spec.models[k] === undefined) continue;
+    try { R.resolveOverride(routePolicy, spec.models[k]); } catch (e) { throw new ConcordError(`models.${k}: ${e.message}`, 'spec'); }
+  }
   models.worker_override = spec.models.worker ?? null;
   models.repair_override = spec.models.repair ?? null;
-  return withLock(loc, 'start', () => {
+  return withLock(loc, 'start', async () => {
     const open = listRuns(loc).map((id) => { try { return readJson(path.join(runDir(loc, id), 'run.json')); } catch { return null; } })
       .filter((r) => r && OPEN.has(r.status));
     if (open.length) throw new ConcordError(`run ${open[0].id} is still open (${open[0].status}); finish, approve/reject or cancel it first`, 'open_run');
@@ -840,6 +910,10 @@ async function cmdStart(loc, opt) {
     }
     const headR = git(loc.repo, ['rev-parse', '--verify', 'HEAD'], { allowFail: true });
     if (headR.status !== 0) throw new ConcordError('repository has no commits; create an initial commit first', 'no_head');
+    // Admitted: only now may the advisory published-alias list be refreshed (bounded; never fatal),
+    // and the policy + catalog are frozen into the run so later refreshes cannot change its routing.
+    const disc = await ensureDiscovery().catch((e) => ({ state: 'failed', error: e.message, cache: loadDiscovery() }));
+    const routing = R.freezeRouting(routePolicy, disc.cache, disc.state);
     const id = newRunId();
     const store = new Store(loc, id);
     const trees = snapshotTrees(loc); // temp index copy only; the real index is not touched
@@ -854,7 +928,7 @@ async function cmdStart(loc, opt) {
     } else if (policy === 'fast') notes.push('fast policy: request matches the trivial docs allowlist; Codex proposal+plan combined.');
     store.run = {
       schema: 1, id, version: VERSION, created_at: now(), repo: loc.repo, request: spec.request, revision: 1, amendments: [], tests: spec.tests,
-      test_selection: selection, requested_policy: spec.policy, policy, policy_notes: notes, limits: spec.limits, models,
+      test_selection: selection, requested_policy: spec.policy, policy, policy_notes: notes, limits: spec.limits, models, routing,
       catalog: catalog ? { refreshed_at: catalog.refreshed_at, source: cachePath() } : null,
       require_clean: spec.require_clean,
       baseline: { head: headR.stdout.trim(), fingerprint: fp(loc).sha256, clean: dirty.length === 0, dirty,
@@ -866,15 +940,20 @@ async function cmdStart(loc, opt) {
     writeJson(store.p('spec.json'), raw);
     const baseline = W.summarizeBaseline(store.run.baseline);
     return { run: id, status: 'active', policy, policy_notes: notes, baseline, checks: describeChecks(store.run), limits: store.run.limits, state_dir: store.dir,
+      routing: routingSummary(store.run),
       next_stage: stageInfo(store), next: cmdFor(store, 'advance', id, '--one-step') };
   });
 }
 
 async function cmdAdvance(loc, id, opt) {
+  // One native report per call, checked before the lock or any write: combining them could switch the
+  // model and in the same breath record work that never ran on it.
+  const native = ['done', 'failed', 'use-fallback'].filter((k) => opt[k] !== undefined);
+  if (native.length > 1) throw new ConcordError(`${native.map((k) => `--${k}`).join(' and ')} cannot be combined; nothing was changed. Run one advance per action`, 'usage');
   return withLock(loc, id, async (lock) => {
     const store = new Store(loc, id); store.load();
     const r = store.run;
-    if (opt.done || opt.failed) checkRevision(r, opt); // before anything is written
+    if (opt.done || opt.failed || opt['use-fallback']) checkRevision(r, opt); // before anything is written
     const stale = markStale(store);
     if (lock.stale) r.policy_notes.push(`${now()}: replaced stale lock from pid ${lock.stale.pid}`);
     if (stale.length && !opt.retry) {
@@ -898,9 +977,11 @@ async function cmdAdvance(loc, id, opt) {
       r.steps.push({ id: opt.failed, attempt: 1, revision: W.revisionOf(r), role: na.action === 'repair' ? 'repair' : 'task', label: W.ROLES[na.action === 'repair' ? 'repair' : 'task'].label,
         provider: 'claude (native)', status: 'failed', at: now(), error: readNote(opt['note-file']) || 'session reported failure' });
       r.status = 'failed'; r.failure = { step: opt.failed, error: 'Claude session reported it could not complete this step', at: now() };
+      r.issued = null;
       store.save();
       return nextAction(store);
     }
+    if (opt['use-fallback']) useFallback(store, opt);
     if (opt.done) recordDone(store, opt);
     if (r.status === 'validated' && fp(loc).sha256 !== r.validation.fingerprint) {
       r.policy_notes.push(`${now()}: working state changed after validation; validation invalidated, re-testing.`);
@@ -924,8 +1005,60 @@ async function cmdAdvance(loc, id, opt) {
         snapshot: { count: perf.snapshot.count - perf0.snapshot.count, ms: perf.snapshot.ms - perf0.snapshot.ms } } };
     r.perf_total = Object.fromEntries(['fingerprint', 'snapshot'].map((k) => [k, { count: (r.perf_total?.[k]?.count ?? 0) + timing.scans[k].count, ms: (r.perf_total?.[k]?.ms ?? 0) + timing.scans[k].ms }]));
     store.save();
-    return { ...nextAction(store), timing };
+    return { ...issue(store, nextAction(store)), timing };
   });
+}
+
+/**
+ * Stamp when a native step was handed to the session (once per step/route/revision). `--done` turns it
+ * into the measured assignment turnaround. Handing the same step out again (resume, a second advance)
+ * marks the measurement unreliable, so it is dropped rather than guessed.
+ */
+function issue(store, na) {
+  const r = store.run;
+  if (!r.routing || !['implement', 'repair'].includes(na.action)) return na;
+  const candidate = na.route?.candidate ?? null;
+  const cur = r.issued;
+  if (cur && cur.step === na.step && cur.candidate === candidate && cur.revision === na.revision) cur.reissued = (cur.reissued ?? 0) + 1;
+  else r.issued = { step: na.step, candidate, revision: na.revision, at: now() };
+  store.save();
+  return na;
+}
+
+/** Explicit, recorded switch of the pending native step to its declared fallback. Never automatic. */
+function useFallback(store, opt) {
+  const r = store.run;
+  const na = nextAction(store);
+  const step = opt['use-fallback'];
+  if (!['implement', 'repair'].includes(na.action) || na.step !== step) throw new ConcordError(`--use-fallback ${step} does not match the pending step ${na.step ?? '(none)'}`, 'usage');
+  const reason = (readNote(opt['note-file']) ?? '').trim();
+  if (!reason) throw new ConcordError('--use-fallback needs --note-file with the exact host error that made the requested model unusable', 'usage');
+  const cur = na.action === 'implement' ? r.tasks.find((t) => t.id === na.task.id).route : repairRoute(r).route;
+  const fb = r.routing ? R.fallbackRoute(r.routing, cur, reason) : null;
+  if (!fb) {
+    throw new ConcordError(`no fallback is available for ${step} (${!r.routing ? 'run has no frozen routing policy' : cur?.source === 'override' ? 'explicit override' : cur?.fallback_used ? 'already on the fallback' : 'none declared for this tier'}). ` +
+      'Nothing was changed. Report the host error, record --failed, and start a new run with another --tier value if the user wants a different model', 'no_fallback');
+  }
+  if (na.action === 'implement') r.tasks.find((t) => t.id === na.task.id).route = fb;
+  else r.repair_switch = { step, tier: na.tier, reason: na.tier_reason, route: fb };
+  r.route_events = [...(r.route_events ?? []), { at: now(), step, kind: 'fallback', from: cur.candidate, to: fb.candidate, reason, revision: W.revisionOf(r) }];
+  r.policy_notes.push(`${now()}: ${step} switched from ${cur.candidate} to declared fallback ${fb.candidate} after a reported host/model error (the primary was NOT used for this step).`);
+  r.issued = null;
+  store.save();
+  timeline(store, { type: 'route.fallback', step, from: cur.candidate, to: fb.candidate });
+}
+
+/** Compact view of the frozen routing for start/status. */
+function routingSummary(r) {
+  const rt = r.routing;
+  if (!rt) return { frozen: false, note: 'Run saved before routing snapshots: tier aliases haiku/sonnet/opus are requested directly.' };
+  const p = rt.policy;
+  return { frozen: true, frozen_at: rt.frozen_at, policy: p.name, policy_source: p.source, policy_note: p.note,
+    tiers: Object.fromEntries(CLAUDE_TIERS.map((t) => [t, { primary: p.routes[t].primary, requested: R.candidateLabel(p.candidates[p.routes[t].primary]), fallback: p.routes[t].fallback,
+      readiness: R.readiness(p.candidates[p.routes[t].primary], rt.catalog) }])),
+    overrides: { worker: r.models.worker_override ?? null, repair: r.models.repair_override ?? null },
+    published_docs: { source: rt.catalog.source, fetched_at: rt.catalog.fetched_at, stale: rt.catalog.stale, aliases: rt.catalog.aliases, refresh: rt.catalog.refresh, last_failure: rt.catalog.last_failure ?? null },
+    route_events: r.route_events ?? [], caveat: rt.caveat, note: rt.note };
 }
 
 function recordDone(store, opt) {
@@ -937,14 +1070,24 @@ function recordDone(store, opt) {
   const executor = opt.executor ?? 'main';
   if (!['subagent', 'main'].includes(executor)) throw new ConcordError('--executor must be subagent or main', 'usage');
   const requested = na.agent?.model ?? na.tier;
+  const rq = na.route
+    ? { requested: na.route.candidate, requested_alias: na.route.alias, subagent_type: na.agent.subagent_type, pinned_model: na.route.pinned_model, effort: na.route.effort,
+      capability_tier: na.tier, source: na.route.source, ...(na.route.fallback_used ? { fallback_used: true, primary: na.route.primary } : {}) }
+    : { requested_alias: requested };
   const model = executor === 'subagent'
-    ? { requested_alias: requested, actual: 'alias resolved by Claude Code; exact model ID not observed' }
-    : { requested_alias: requested, actual: 'inherited from the main session; actual model unknown to the helper (no switching performed)' };
+    ? { ...rq, actual: na.route?.kind === 'agent'
+      ? 'requested through the packaged agent; the model that actually ran was not observed by the helper'
+      : 'alias resolved by Claude Code; exact model ID not observed' }
+    : { ...rq, actual: 'inherited from the main session; actual model unknown to the helper (no switching performed; the requested candidate was NOT used)' };
+  // Measured only when this exact step was handed out once and not re-issued; otherwise no number at all.
+  const iss = r.issued?.step === opt.done ? r.issued : null;
+  const timing = iss && !iss.reissued && executor === 'subagent' ? { issued_at: iss.at, turnaround_ms: Date.now() - Date.parse(iss.at) } : {};
+  r.issued = null;
   const fpNow = fp(store.loc).sha256;
   const prev = [...r.steps].reverse().find((s) => s.fingerprint)?.fingerprint ?? r.baseline.fingerprint;
   const role = na.action === 'repair' ? 'repair' : 'task';
   const step = { id: opt.done, attempt: r.steps.filter((s) => s.id === opt.done).length + 1, role, label: W.ROLES[role].label,
-    provider: 'claude (native)', executor, model, status: 'passed', at: now(), fingerprint: fpNow, changed: fpNow !== prev, revision: W.revisionOf(r), note: readNote(opt['note-file']) };
+    provider: 'claude (native)', executor, model, ...timing, status: 'passed', at: now(), fingerprint: fpNow, changed: fpNow !== prev, revision: W.revisionOf(r), note: readNote(opt['note-file']) };
   r.steps.push(step);
   if (role === 'repair' && fpNow === prev) {
     // A repair that changed nothing would only replay the same tests/QA: stop here.
@@ -1027,9 +1170,11 @@ function cmdStatus(loc, id, opt) {
     baseline: r.baseline.head, baseline_state: W.summarizeBaseline(r.baseline), working_state: fpNow, working_state_check: verification,
     validation: r.validation ? { ...r.validation, current: fpNow === null ? null : r.validation.fingerprint === fpNow, verification } : null,
     approval: r.approval, failure: r.failure, helper_running: helper ? helper.pid : null, running,
-    steps: r.steps.map(({ id: sid, attempt, label, provider, model, status, ms, error, reason, executor, revision, pid, last_output_at, bytes, event_counts, no_output, process_ms, failure_class, logs, timeout_s, cwd, output_format }) =>
-      ({ id: sid, attempt, label, provider, model, status, ms, error, reason, executor, revision, pid, last_output_at, bytes, event_counts, no_output, process_ms, failure_class, timeout_s, cwd, output_format, has_logs: !!logs })),
-    tasks: r.tasks.map(({ id: tid, title, status, tier, tier_reason }) => ({ id: tid, title, status, tier, tier_reason })),
+    steps: r.steps.map(({ id: sid, attempt, label, provider, model, status, ms, error, reason, executor, revision, pid, last_output_at, bytes, event_counts, no_output, process_ms, failure_class, logs, timeout_s, cwd, output_format, turnaround_ms }) =>
+      ({ id: sid, attempt, label, provider, model, status, ms, error, reason, executor, revision, pid, turnaround_ms, last_output_at, bytes, event_counts, no_output, process_ms, failure_class, timeout_s, cwd, output_format, has_logs: !!logs })),
+    tasks: r.tasks.map(({ id: tid, title, status, tier, tier_reason, computed_tier, route }) => ({ id: tid, title, status, tier, tier_reason, computed_tier,
+      ...(route ? { route: { candidate: route.candidate, requested: route.label, source: route.source, reason: route.reason, fallback: route.fallback, fallback_used: route.fallback_used === true } } : {}) })),
+    routing: routingSummary(r),
     checks: describeChecks(r), check_coverage: r.validation?.check_coverage ?? r.check_coverage ?? null,
     limits: { ...r.limits, effective_review_timeout_s: r.limits.review_timeout_s ?? r.limits.cli_timeout_s, live_override_s: readControl(store, true)?.review_timeout_s ?? null },
     repairs: `${r.repairs_used}/${r.limits.max_repairs}`, next: nextAction(store), state_dir: store.dir,
@@ -1048,12 +1193,19 @@ function cmdStatus(loc, id, opt) {
     ...(report.amendments.length ? ['amendments:', ...report.amendments.map((a) => `  r${a.revision} [${a.kind}] ${a.text.split('\n')[0].slice(0, 160)}`)] : []),
     'steps:',
     ...r.steps.map((s) => {
-      const model = typeof s.model === 'string' ? s.model : s.model ? `${s.model.requested_alias} [${s.executor}]` : '';
+      const model = typeof s.model === 'string' ? s.model : s.model ? `requested ${s.model.requested ?? s.model.requested_alias}${s.model.fallback_used ? ' (FALLBACK)' : ''} [${s.executor}; actual not observed]` : '';
       const live = s.status === 'running' ? ` elapsed ${fmtS(Date.now() - Date.parse(s.started_at))}${s.timeout_s !== undefined ? `, ${limitText(s.timeout_s)}` : ''}${s.pid ? `, pid ${s.pid}` : ''}${s.no_output ? ', no output yet' : s.last_output_at ? `, last output ${s.last_output_at}` : ''}` : '';
       return `  ${mark[s.status] ?? '?'} ${s.id}${s.attempt > 1 ? `#${s.attempt}` : ''}  ${s.label} · ${s.provider}${model ? `:${model}` : ''}${s.ms ? ` ${(s.ms / 1000).toFixed(1)}s` : ''}${live}${s.reason ? ` — ${s.reason}` : ''}${s.error ? ` — ${s.error.split('\n')[0].slice(0, 200)}` : ''}`;
     }),
   ];
-  if (r.tasks.length) lines.push('tasks:', ...r.tasks.map((t) => `  [${t.status}] ${t.id} ${t.title} → ${t.tier} (${t.tier_reason})`));
+  if (r.tasks.length) lines.push('tasks:', ...r.tasks.map((t) => `  [${t.status}] ${t.id} ${t.title} → ${t.tier} tier (${t.tier_reason})${t.route ? `; requested ${t.route.label}${t.route.fallback_used ? ' [FALLBACK in use]' : t.route.fallback ? ` [fallback ${t.route.fallback}]` : ''} — ${t.route.source}` : ''}`));
+  const ro = report.routing;
+  if (ro.frozen) {
+    lines.push(`routing: policy "${ro.policy}" (${ro.policy_source}) frozen ${ro.frozen_at}; ${CLAUDE_TIERS.map((k) => `${k}→${ro.tiers[k].primary}${ro.tiers[k].fallback ? `|${ro.tiers[k].fallback}` : ''}`).join(', ')}`,
+      `  published docs: ${ro.published_docs.fetched_at ? `${ro.published_docs.source} @ ${ro.published_docs.fetched_at}${ro.published_docs.stale ? ' (stale)' : ''}` : 'no cache'} [${ro.published_docs.refresh}]`,
+      ...ro.route_events.map((e) => `  ${e.at} ${e.step}: ${e.from} → ${e.to} (${e.kind}): ${e.reason.split('\n')[0].slice(0, 160)}`),
+      `  ${ro.caveat}`);
+  } else lines.push(`routing: ${ro.note}`);
   const d = report.discussion;
   lines.push('政事堂议事 (run artifacts):',
     `  proposal: ${d.proposal ? d.proposal.summary : 'not produced'}`,
@@ -1213,6 +1365,10 @@ async function cmdApprove(loc, id, opt) {
       recorded_by: '天子决之 · 人工审批 (human decision recorded by helper)', effect: 'record only — no commit, merge, push or deployment' };
     r.status = opt.decision === 'approve' ? 'approved' : 'rejected';
     store.save();
+    // Advisory ledger: approved clean runs only. A rejection is a human decision, never a model-quality sample.
+    let outcome = { recorded: false, reason: 'not an approval' };
+    if (r.status === 'approved') { try { outcome = R.recordOutcome(r); } catch (e) { outcome = { recorded: false, reason: `ledger error: ${e.message}` }; } }
+    r.approval.outcome_ledger = outcome; store.save();
     return { run: id, status: r.status, approval: r.approval };
   });
 }
@@ -1274,6 +1430,7 @@ function cmdPreflight(loc, opt) {
     codex_on_path: { ok: !!which(b.codex), value: which(b.codex) },
     grok_on_path: { ok: !!which(b.grok), value: which(b.grok) },
     model_cache: { ok: true, value: catalog ? `${cachePath()} refreshed ${catalog.refreshed_at}${age > TTL_S ? ' (stale; models --refresh)' : ''}` : 'none (account defaults will be used)' },
+    claude_routing: preflightRouting(),
     state_dir: { ok: true, value: loc.stateRoot },
   };
   const ok = Object.values(checks).every((c) => c.ok);
@@ -1286,19 +1443,98 @@ function cmdPreflight(loc, opt) {
     out.note].join('\n');
 }
 
+/** Local read only (no fetch): which routing policy and published-alias cache a start would use. */
+function preflightRouting() {
+  const d = loadDiscovery();
+  const docs = d?.fetched_at ? `published aliases cached ${d.fetched_at}${Date.now() - Date.parse(d.fetched_at) > TTL_MS ? ' (older than a day; start refreshes it)' : ''}` : 'no published-alias cache (start fetches it once; routing works without it)';
+  try {
+    const p = R.loadPolicy({ discovered: (d?.aliases ?? []).map((a) => a.alias) });
+    return { ok: true, value: `policy "${p.name}" (${p.source}): ${CLAUDE_TIERS.map((t) => `${t}→${p.routes[t].primary}`).join(', ')}; ${docs}` };
+  } catch (e) { return { ok: false, value: e.message }; }
+}
+
+function routingReport() {
+  const d = loadDiscovery();
+  let policy = null; let error = null;
+  try { policy = R.loadPolicy({ discovered: (d?.aliases ?? []).map((a) => a.alias) }); } catch (e) { error = e.message; }
+  const known = new Set(policy ? Object.values(policy.candidates).map((c) => c.alias).filter(Boolean) : []);
+  return {
+    policy: policy && { name: policy.name, source: policy.source, stored_at: policy.stored_at, note: policy.note, routes: policy.routes, baselines: policy.baselines, overrides: policy.overrides,
+      candidates: Object.fromEntries(Object.entries(policy.candidates).map(([k, c]) => [k, { requested: R.candidateLabel(c), tiers: c.tiers, readiness: R.readiness(c, d && { ...d, aliases: d.aliases.map((a) => a.alias) }) }])) },
+    policy_error: error,
+    packaged_agents: R.listAgents(),
+    published_docs: d ? { source: d.source, fetched_at: d.fetched_at, stale: !d.fetched_at || Date.now() - Date.parse(d.fetched_at) > TTL_MS, aliases: d.aliases, anthropic_api_resolution: d.anthropic_api_resolution ?? null,
+      failures: d.failures ?? 0, last_failure: d.last_failure ?? null, next_retry_at: d.next_retry_at ?? null,
+      unconfigured: d.aliases.map((a) => a.alias).filter((a) => !known.has(a)) } : { source: OFFICIAL_URL, fetched_at: null, note: `no cache at ${discoveryFile()}; fetched at the next admitted start or models --refresh` },
+    caveat: R.CAVEAT,
+  };
+}
+
+function routingLines(rr) {
+  const lines = [];
+  if (rr.policy_error) lines.push(`Claude routing policy: INVALID — ${rr.policy_error}`);
+  else {
+    const p = rr.policy;
+    lines.push(`Claude routing policy "${p.name}" — ${p.source}${p.stored_at ? ` (stored ${p.stored_at})` : ''}`, `  ${p.note}`,
+      ...CLAUDE_TIERS.map((t) => `  ${t} tier → ${p.routes[t].primary}${p.routes[t].fallback ? ` (fallback ${p.routes[t].fallback})` : ''}; advisory baseline ${p.baselines[t]}`),
+      `  --tier shorthands: ${Object.entries(p.overrides).map(([k, v]) => `${k}=${v}`).join(', ')}; any candidate key is also accepted`,
+      '  candidates:', ...Object.entries(p.candidates).map(([k, c]) => `    ${k}: ${c.requested}; tiers ${c.tiers.join('/')}; ${c.readiness}`));
+  }
+  const d = rr.published_docs;
+  lines.push(d.fetched_at
+    ? `  published docs: ${d.source} @ ${d.fetched_at}${d.stale ? ' (STALE)' : ''}: ${d.aliases.map((a) => a.alias).join(', ')}${d.unconfigured.length ? `; published but not in the policy (candidate only; needs host compatibility + an explicit profile entry): ${d.unconfigured.join(', ')}` : ''}`
+    : `  published docs: ${d.note ?? `no successful fetch yet (${d.source})`}`);
+  if (d.last_failure) lines.push(`  last refresh failure ${d.last_failure.at}: ${d.last_failure.error}${d.next_retry_at ? `; next automatic attempt after ${d.next_retry_at}` : ''} (last good data kept)`);
+  lines.push(`  ${rr.caveat}`);
+  return lines;
+}
+
+function observationsReport() {
+  let policy;
+  try { policy = R.loadPolicy({ discovered: (loadDiscovery()?.aliases ?? []).map((a) => a.alias) }); } catch (e) { throw new ConcordError(e.message, 'routing_policy'); }
+  const ledger = R.loadLedger();
+  return { file: R.ledgerFile(), ...R.compareOutcomes(ledger, policy),
+    recent: ledger.runs.slice(-10).map((x) => ({ run: x.run, approved_at: x.approved_at, candidate: x.candidate, requested: x.requested, tasks: x.tasks })) };
+}
+
 async function cmdModels(opt) {
+  if (opt.routing !== undefined || opt['reset-routing'] || opt['reset-observations']) {
+    const out = {};
+    if (opt['reset-routing']) out.routing_reset = { removed: R.resetProfile(), now: 'built-in default routing policy' };
+    if (opt['reset-observations']) out.observations_reset = { removed: R.resetLedger() };
+    if (opt.routing !== undefined) {
+      try { const p = R.storeProfile(path.resolve(opt.routing), { discovered: (loadDiscovery()?.aliases ?? []).map((a) => a.alias) }); out.routing_stored = { name: p.name, file: R.profileFile(), stored_at: p.stored_at }; } catch (e) { throw new ConcordError(`${e.message}. Nothing was stored`, 'routing_policy'); }
+    }
+    const rr = routingReport();
+    if (opt.json) return { ...out, routing: rr };
+    return [...Object.entries(out).map(([k, v]) => `${k}: ${JSON.stringify(v)}`), 'Applies to runs started from now on; open and finished runs keep their frozen routing.', ...routingLines(rr)].join('\n');
+  }
+  if (opt.observations) {
+    const o = observationsReport();
+    if (opt.json) return o;
+    const ex = Object.entries(o.excluded).filter(([, n]) => n > 0).map(([k, n]) => `${n} ${k}`).join(', ');
+    return [`Outcome ledger ${o.file}: ${o.runs} approved clean run(s), ${o.runs_compared} compared${ex ? `; excluded from comparison: ${ex} (${o.excluded_note})` : ''}`,
+      ...(o.cohorts.length ? o.cohorts.flatMap((c) => [`  cohort ${c.cohort} (tier/difficulty/risk), baseline ${c.baseline} (${c.baseline_samples} sample(s))`,
+        ...c.candidates.map((x) => `    ${x.candidate} [${x.role}]: n=${x.samples}, median ${fmtS(x.median_ms)}${x.verdict ? ` — ${x.verdict}${x.speedup !== undefined ? ` (${Math.round(x.speedup * 100)}% vs baseline)` : ''}${x.why ? `: ${x.why}` : ''}` : ''}`)]) : ['  no qualifying evidence yet']),
+      o.note].join('\n');
+  }
+  let claudeRefresh = null;
+  if (opt.refresh) claudeRefresh = await ensureDiscovery({ force: true }).then((x) => ({ state: x.state, error: x.error ?? null }), (e) => ({ state: 'failed', error: e.message }));
+  const rr = routingReport();
+  const extra = { routing: rr, ...(claudeRefresh ? { claude_docs_refresh: claudeRefresh } : {}) };
   const catalog = opt.refresh ? await refreshCatalog(bins(), path.join(os.tmpdir(), `concord-models-${process.pid}`)) : loadCatalog();
-  if (opt.json) return catalog ?? { providers: null, note: 'no cache; run models --refresh' };
-  if (!catalog) return `No model cache at ${cachePath()}. External roles use each CLI's account default.\nRun \`models --refresh\` to list account models via local CLIs. Claude tiers: ${CLAUDE_TIERS.join(', ')} (Agent tool aliases).`;
+  if (opt.json) return { ...(catalog ?? { providers: null, note: 'no cache; run models --refresh' }), ...extra };
+  const tail2 = [...(claudeRefresh ? [`Claude published-alias refresh: ${claudeRefresh.state}${claudeRefresh.error ? ` — ${claudeRefresh.error}` : ''}`] : []), ...routingLines(rr)];
+  if (!catalog) return [`No model cache at ${cachePath()}. External roles use each CLI's account default.\nRun \`models --refresh\` to list account models via local CLIs. Claude capability tiers: ${CLAUDE_TIERS.join(', ')}.`, ...tail2].join('\n');
   const age = catalogAge(catalog);
   const lines = [`Model catalog ${cachePath()} (refreshed ${catalog.refreshed_at}, ${Math.round(age / 3600)}h ago${age > TTL_S ? ', STALE' : ''})`];
   for (const [name, p] of Object.entries(catalog.providers)) {
     lines.push(`  ${name}: ${p.status} — source: ${p.source} @ ${p.observed_at}${p.error ? ` — ${p.error}` : ''}`);
     if (p.models.length) lines.push(`    ${p.models.join(', ')}`);
     if (p.note) lines.push(`    ${p.note}`);
-    lines.push(`    official reference (not fetched): ${p.docs ?? DOCS[name]}`);
+    lines.push(name === 'claude' ? `    official reference: ${p.docs ?? DOCS[name]} (published aliases: see below)` : `    official reference (not fetched): ${p.docs ?? DOCS[name]}`);
   }
-  lines.push(catalog.note);
+  lines.push(catalog.note, ...tail2);
   return lines.join('\n');
 }
 
@@ -1336,7 +1572,7 @@ async function main(argv) {
       const store = new Store(loc, rid); store.load();
       if (lock.stale) { store.run.policy_notes.push(`${now()}: replaced stale lock from pid ${lock.stale.pid}`); store.save(); }
       const stale = markStale(store);
-      return { ...nextAction(store), interrupted: stale, ...(stale.length ? { message: `Interrupted step(s) ${stale.join(', ')} recorded; not re-executed. advance --retry runs them again.` } : {}) };
+      return { ...issue(store, nextAction(store)), interrupted: stale, ...(stale.length ? { message: `Interrupted step(s) ${stale.join(', ')} recorded; not re-executed. advance --retry runs them again.` } : {}) };
     }); }
     case 'status': return cmdStatus(loc, resolveRunId(loc, pos[1]), opt);
     case 'list': return listRuns(loc).map((id) => {

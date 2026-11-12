@@ -1,7 +1,7 @@
 ---
 name: run
 description: Drive a 贞观·政事堂 · Concord (Concord V3) run step by step in this session — Codex proposal, Grok review, Codex task plan, implementation by this session or native Claude subagents, real tests, read-only Codex QA, bounded repair. Use only when the user explicitly invokes /concord:run.
-argument-hint: "[<request>] [--policy fast] [--require-clean] [--model qa=<id>] [--tier worker=opus] [--max-repairs N] [--review-timeout S|0] [--test '<cmd>']..."
+argument-hint: "[<request>] [--policy fast] [--require-clean] [--model qa=<id>] [--tier worker=fable|opus|sonnet|haiku] [--max-repairs N] [--review-timeout S|0] [--test '<cmd>']..."
 disable-model-invocation: true
 ---
 
@@ -72,11 +72,27 @@ To do an `implement` or `repair` step:
 
 - Work to the action's `request` (the original request plus all amendments) and tell the user about any
   `check_coverage` warning before you start; don't add checks or ask new questions because of it.
-- Default: call the **Agent** tool with `subagent_type: "general-purpose"` and `model` set to the
-  action's `agent.model` (`haiku`, `sonnet` or `opus`). Pass the task or cause JSON, the `request` and the `rules`
+- Default: call the **Agent** tool with exactly the keys in the action's `agent` object. It is either
+  `{subagent_type: "general-purpose", model: "<alias>"}`, or a packaged agent such as
+  `{subagent_type: "concord:fable-worker"}` with **no** `model` key. Never add a `model` to a packaged agent (it
+  would override the model and effort pinned in its frontmatter), never pass a full model ID, and never pick a
+  different model yourself. Pass the task or cause JSON, the `request` and the `rules`
   text, and say "work in the current checkout; don't commit; preserve the pre-existing uncommitted edits listed in `baseline`". Report `--executor subagent`.
-- For a tiny step you may edit it yourself and report `--executor main`. The helper records that as
-  "inherited model, unknown", not as a model switch.
+- If the Agent call itself is refused or cannot start (unknown agent type, model or effort unavailable, denied or
+  unsupported by this Claude Code version): first tell the user the exact error. Then, only if the action has
+  `fallback.available: true`, write that error to a file with Write and run the action's `fallback.switch` command
+  (`advance --use-fallback <step> --revision <revision> --note-file <file>`); it returns the same step with the
+  declared fallback agent. Say in the final summary that the fallback ran, not the primary. With no fallback,
+  record `--failed` with the error; don't retry in a loop and don't substitute a model. Failing code, tests or QA
+  are never a reason to switch models.
+- When you report models, say "requested" (`route.requested`): the helper never observes which model actually ran.
+- Doing a step yourself (`--executor main`) is allowed only when the action says `main_session.allowed: true`:
+  a tiny `implement` step in the low (`haiku`) tier whose model is the policy's ordinary alias. Never do it for
+  a packaged agent (`agent` has no `model` key), an explicit `--tier` choice, a fallback, a normal or hard-tier
+  task, or any `repair`: that would silently replace the model the user asked for with this session's model.
+  Legacy actions without `main_session`: only a tiny `haiku`-tier task with no `--tier` override. This is a rule
+  for you, not something the helper can enforce; if you did use the main session, report `--executor main`
+  truthfully. The helper records it as "inherited model, unknown", and such a run gives no model evidence.
 - Run steps one at a time; no parallel subagents (serial, single checkout).
 - If the step can't be done, write the reason with Write and run
   `H advance <run> --failed <step> --revision <revision> --note-file <file>`.

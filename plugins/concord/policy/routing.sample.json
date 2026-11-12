@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "name": "fable-high-preferred",
+  "note": "User policy: hard work prefers Fable 5.2 at high effort, with Opus 5.5 at xhigh effort as the declared fallback. This is a user preference, not a benchmark result.",
+  "candidates": {
+    "haiku": {
+      "alias": "haiku",
+      "tiers": [
+        "haiku"
+      ]
+    },
+    "sonnet": {
+      "alias": "sonnet",
+      "tiers": [
+        "sonnet"
+      ]
+    },
+    "opus-alias": {
+      "alias": "opus",
+      "tiers": [
+        "opus"
+      ]
+    },
+    "fable-alias": {
+      "alias": "fable",
+      "tiers": [
+        "opus"
+      ]
+    },
+    "fable-5.2-high": {
+      "agent": "fable-worker",
+      "tiers": [
+        "opus"
+      ]
+    },
+    "opus-5.5-xhigh": {
+      "agent": "opus-worker",
+      "tiers": [
+        "opus"
+      ]
+    }
+  },
+  "routes": {
+    "haiku": {
+      "primary": "haiku",
+      "fallback": null
+    },
+    "sonnet": {
+      "primary": "sonnet",
+      "fallback": null
+    },
+    "opus": {
+      "primary": "fable-5.2-high",
+      "fallback": "opus-5.5-xhigh"
+    }
+  },
+  "baselines": {
+    "haiku": "haiku",
+    "sonnet": "sonnet",
+    "opus": "opus-5.5-xhigh"
+  },
+  "overrides": {
+    "opus": "opus-5.5-xhigh",
+    "fable": "fable-5.2-high"
+  }
+}

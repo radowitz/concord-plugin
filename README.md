@@ -2,7 +2,7 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-A Claude Code plugin (v0.2.2) that runs a multi-model review-and-QA workflow inside your current session. Codex proposes and plans, Grok reviews, Claude writes the code, your real tests decide, and a read-only Codex QA gates the result. You stay the final authority.
+A Claude Code plugin (v0.3.0) that runs a multi-model review-and-QA workflow inside your current session. Codex proposes and plans, Grok reviews, Claude writes the code, your real tests decide, and a read-only Codex QA gates the result. You stay the final authority.
 
 ```mermaid
 flowchart LR
@@ -62,17 +62,17 @@ These are organizational metaphors. The current plugin executes implementation t
 
 ## Design
 
-- **Model routing:** each task gets a `haiku`, `sonnet` or `opus` alias based on risk (override with `--tier worker=…`).
+- **Model routing:** each task gets a capability tier from its difficulty and risk. Low → the `haiku` alias, normal → the `sonnet` alias, hard → **Fable 5.2 at high effort**, with **Opus 5.5 at xhigh effort** as the declared fallback (a user preference, not a benchmark; both are pinned in packaged agents). Override per run with `--tier worker=…`, or change the defaults with a local routing profile. Concord records what it *requested*; it never sees which model actually ran. See [Model routing](plugins/concord/README.md#model-routing).
 - **Serial, dirty-tolerant start:** a run can start on a checkout with uncommitted work. That work is snapshotted as the baseline and preserved; only the unrelated baseline work is excluded from the change diff, and QA may still flag an existing defect that blocks the requested outcome. Implementation is serial. Opt in to a clean-only start with `--require-clean`.
 - **Auto-detected checks:** no `--test` needed. Concord reads the nearest `package.json` (scripts, `packageManager`, lockfiles for npm/pnpm/yarn/bun) and runs `<pm> run test|check|typecheck|lint|build` as argv, skipping placeholders and watch scripts. If nothing reliable exists it asks instead of passing. A typecheck/lint/build gate is reported as such, not as tests. `--test` is an optional override.
 - **Bound to its worktree:** a run is tied to the checkout it started in. Mutating commands from another worktree of the same repository fail with `wrong_worktree` before anything is written; read-only views label such a run as foreign instead of comparing the wrong files.
 - **Checks run where you meant:** explicit checks run in the directory you started from (optional `tests_cwd` for root commands); the cwd is recorded and shown. After planning, Concord warns when planned files lie outside what the check can be shown to cover; it never adds checks or claims coverage it cannot prove.
 - **Changing the goal mid-run:** the host records a new requirement with an internal `amend` (revision, history, validation invalidated, edits kept; scope changes get a fresh Grok review, then re-plan). Claude Code does support `UserPromptSubmit` hooks, but this plugin registers no hooks, so nothing intercepts chat automatically: the host amends only when the skill instructs it to and it judges your message modifies the active task (best-effort host behaviour, not guaranteed). Ordinary chat is not meant to amend.
 - **Waiting and visibility:** Codex/Grok steps get 1800 s by default (`0` = wait manually; `extend` changes it while running). Soft 30 s notices never kill a step. Stages run as labelled background Bash tasks in `/tasks`; Codex/Grok stay external CLIs, not native Claude agents. Raw stdout/stderr and normalised events (Codex `--json`, Grok `streaming-json`) are logged as they arrive and readable with `/concord:logs` while the stage runs.
-- **Repair routing:** repairs inherit the highest relevant task tier (Opus for high risk) unless `--tier repair=…` is set.
+- **Repair routing:** repairs inherit the highest relevant task tier (at least `sonnet`; the hard tier for high risk, so Fable 5.2/high by default) unless `--tier repair=…` is set.
 - **Light footprint:** no daemon, no Python, no npm; Node builtins only.
 - **Human in control:** no automatic commit, push or deploy.
-- **Validation:** [verification record](docs/verification.md): 93 deterministic tests passed. One real native headless Claude Code task completed Codex → Grok → Codex → main-session implementation → project tests → Codex QA in about 132 s, preserving pre-existing files and HEAD. Interactive UI, native Agent execution and real long-wait controls remain unverified.
+- **Validation:** [verification record](docs/verification.md): 124 deterministic tests passed; a read-only native Fable worker canary also passed. One real native headless Claude Code task completed Codex → Grok → Codex → main-session implementation → project tests → Codex QA in about 132 s, preserving pre-existing files and HEAD. Interactive UI, native Agent coding and real long-wait controls remain unverified.
 
 ## Failures, recovery and approval
 
@@ -84,7 +84,7 @@ Human approval records a decision for the exact validated working state. It does
 
 ## Versions
 
-Current version: **v0.2.2**. See the [English changelog](CHANGELOG.md) or [中文更新日志](CHANGELOG.zh-CN.md) for every published version. Restart Claude Code after updating the installed plugin.
+Current version: **v0.3.0** (source version; the latest published Git tag is v0.2.2). See the [English changelog](CHANGELOG.md) or [中文更新日志](CHANGELOG.zh-CN.md) for every published version. Restart Claude Code after updating the installed plugin.
 
 ## From source
 
@@ -92,7 +92,7 @@ Current version: **v0.2.2**. See the [English changelog](CHANGELOG.md) or [中�
 git clone https://github.com/radowitz/concord-plugin.git
 cd concord-plugin
 claude --plugin-dir ./plugins/concord
-node --test tests/claude_plugin.test.mjs
+node --test tests/*.test.mjs   # both suites: claude_plugin + model-routing (offline, fake CLIs)
 ```
 
 Docs: [detailed plugin README](plugins/concord/README.md) · [MIT License](LICENSE)

@@ -9,6 +9,22 @@
 - 中英文 README 分开，默认展示英文。
 - 补充机构职责、失败恢复、审批含义和逐版本更新日志。
 
+## 0.3.0（尚未发布）
+
+源码及本地安装版本，尚未发布 Git 标签或 GitHub Release。
+
+- 能力档位（`haiku`/`sonnet`/`opus`）与所请求的模型分离。困难任务默认请求 Fable 5.2（high effort），Opus 5.5（xhigh effort）为声明的备选（用户策略，不是基准结论）。低档和普通任务仍请求 `haiku`、`sonnet` 别名。
+- 打包代理 `concord:fable-worker`、`concord:opus-worker` 固定完整模型 ID 与 effort，调用时不传 `model` 参数。`--tier` 接受 `haiku|sonnet|opus|fable` 或配置中的候选键；完整模型 ID 会被拒绝。
+- 显式且有记录的备选切换：`advance --use-fallback <step> --note-file <错误>`，绝不静默替换。
+- 本地路由配置：`models --routing FILE`、`models --reset-routing`。策略与已发布别名快照冻结在每个任务中；旧任务保持原有路由。
+- 从官方 model-config 页面发现已发布的 Claude 别名，仅供参考（在被接受的 `start` 且缓存缺失或超过一天时、或 `models --refresh` 时，进行有界 HTTPS 获取；保留上次成功结果、失败退避、`CONCORD_MODEL_DISCOVERY=off`）。`preflight`、`status`、`advance` 不联网。
+- 基于已批准的干净原生任务的参考性结果记录（`models --observations`、`models --reset-observations`），从不改变路由。
+- 新增测试文件 `tests/model-routing.test.mjs`；用 `node --test tests/*.test.mjs` 运行全部测试。
+- 结果比较绑定到确切的请求配置（类型、别名、代理类型、固定模型、effort）；候选键含义改变后，旧样本会被排除并计数。
+- `advance` 在任何修改之前拒绝同时使用 `--done`、`--failed`、`--use-fallback`。
+- 技能把主会话执行限制为低档、使用策略别名的极小任务（动作中的 `main_session.allowed`）；打包代理、覆盖、备选、更高档位和修复始终使用所请求的代理。
+- 验证：见 `docs/verification.md`（124 项离线测试及只读 Fable 原生代理冒烟测试通过；完整原生编码与真实回退尚未验证）。
+
 ## [0.2.2](https://github.com/radowitz/concord-plugin/releases/tag/v0.2.2)
 
 ### 新增

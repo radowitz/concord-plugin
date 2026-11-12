@@ -1,5 +1,6 @@
 // Model catalog (explicit, cached discovery through local CLI commands only)
-// and deterministic Claude tier routing (吏部选才). No inference, no HTTP.
+// and deterministic Claude capability-tier computation (吏部选才). No inference, no HTTP here:
+// the published Claude alias list is handled in discovery.mjs, routing policy in routing.mjs.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,25 +8,27 @@ import { run } from './proc.mjs';
 import { readJson, writeJson } from './state.mjs';
 
 export const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-export const CLAUDE_TIERS = ['haiku', 'sonnet', 'opus']; // current Agent-tool aliases
+export const CLAUDE_TIERS = ['haiku', 'sonnet', 'opus']; // CAPABILITY tiers (not model names, not a version ranking)
+export const CLAUDE_ALIASES = ['haiku', 'sonnet', 'opus', 'fable']; // Agent-tool per-call model values (sub-agents docs)
 export const TTL_S = 7 * 86400;
 const DISCOVERY_TIMEOUT_MS = 15000;
 // Per-provider output caps. `codex debug models` embeds full model capabilities and
 // base instructions (~630 KiB observed for 10 models), so it needs a larger bound.
 export const MAX_BYTES = { codex: 32 * 1024 * 1024, grok: 512 * 1024 };
 export const DOCS = {
-  // Same reference pages as the Concord backend (agentflow_models.DOCS); shown, never fetched.
+  // Reference pages. Codex/Grok pages are shown, never fetched; the Claude page is read only by discovery.mjs.
   codex: 'https://learn.chatgpt.com/docs/models.md',
   grok: 'https://docs.x.ai/developers/models',
   claude: 'https://code.claude.com/docs/en/model-config.md',
 };
 export const RISK = /payment|billing|auth|security|migration|concurren|credential|secret|permission|deploy|production|delete|destruct|database|crypto|数据库|删除|凭据|密钥|权限|部署|支付|账单|认证|鉴权|授权|安全|迁移|并发/i;
 
-export function cachePath() {
-  const base = process.env.CONCORD_CACHE_DIR
+export function cacheDir() {
+  return process.env.CONCORD_CACHE_DIR
     || path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'concord');
-  return path.join(base, 'models.json');
 }
+
+export function cachePath() { return path.join(cacheDir(), 'models.json'); }
 
 export function loadCatalog() {
   try {
@@ -104,11 +107,11 @@ export async function refreshCatalog(bins, tmpDir) {
   }
   providers.claude = {
     status: 'aliases', source: 'Claude Code Agent tool model aliases', observed_at: at,
-    models: [...CLAUDE_TIERS], docs: DOCS.claude,
+    models: [...CLAUDE_ALIASES], docs: DOCS.claude,
     note: 'Aliases resolve to whatever Claude Code currently maps them to; the exact model ID is not observed by this helper.',
   };
   const catalog = { schema: 1, refreshed_at: at, providers,
-    note: 'Account-listed = reported by your local CLI for your account. Official published lists are not fetched (no networking); see docs URLs.' };
+    note: 'Account-listed = reported by your local CLI for your account. Published Codex/Grok lists are not fetched; see docs URLs. Claude: see the routing policy and published-alias state below.' };
   writeJson(cachePath(), catalog);
   return catalog;
 }

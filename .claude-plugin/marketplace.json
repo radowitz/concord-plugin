@@ -5,7 +5,7 @@
   "plugins": [
     {
       "name": "concord",
-      "version": "0.2.2",
+      "version": "0.3.0",
       "description": "贞观·政事堂 · Concord: native Claude Code workflow with Codex proposal/plan/QA and Grok review. No daemon, no backend; never commits, pushes or deploys.",
       "source": "./plugins/concord"
     }
