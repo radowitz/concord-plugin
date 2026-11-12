@@ -4,14 +4,10 @@
 
 以下版本对应已发布的 Git 标签。`main` 上的纯文档更新不代表发布了新的插件版本。
 
-## 尚未发布
+## [0.3.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0) — 2026-11-12
 
 - 中英文 README 分开，默认展示英文。
 - 补充机构职责、失败恢复、审批含义和逐版本更新日志。
-
-## 0.3.0（尚未发布）
-
-源码及本地安装版本，尚未发布 Git 标签或 GitHub Release。
 
 - 能力档位（`haiku`/`sonnet`/`opus`）与所请求的模型分离。困难任务默认请求 Fable 5.2（high effort），Opus 5.5（xhigh effort）为声明的备选（用户策略，不是基准结论）。低档和普通任务仍请求 `haiku`、`sonnet` 别名。
 - 打包代理 `concord:fable-worker`、`concord:opus-worker` 固定完整模型 ID 与 effort，调用时不传 `model` 参数。`--tier` 接受 `haiku|sonnet|opus|fable` 或配置中的候选键；完整模型 ID 会被拒绝。

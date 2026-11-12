@@ -4,14 +4,10 @@
 
 Versions below correspond to published Git tags. Documentation-only changes on `main` do not imply a new plugin release.
 
-## Unreleased
+## [0.3.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0) — 2026-11-12
 
 - Separate English and Chinese READMEs, with English as the default.
 - Add architecture roles, failure/recovery and approval explanations, and versioned changelogs.
-
-## 0.3.0 (unreleased)
-
-Source and local installation version; no Git tag or GitHub Release yet.
 
 - Capability tiers (`haiku`/`sonnet`/`opus`) are now separate from the requested model. Hard work requests Fable 5.2 at high effort by default, with Opus 5.5 at xhigh effort as the declared fallback (user policy, not a benchmark). Low and normal work still request the `haiku` and `sonnet` aliases.
 - Packaged agents `concord:fable-worker` and `concord:opus-worker` pin the full model ID and effort; they are called without a `model` parameter. `--tier` accepts `haiku|sonnet|opus|fable` or a profile candidate key; full model IDs are rejected.

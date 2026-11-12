@@ -2,7 +2,7 @@
 
 **English** · [中文](#中文)
 
-## v0.3.0 local upgrade (2026-11-12, not tagged or published)
+## v0.3.0 verification (2026-11-12)
 
 What was actually run for the model-routing upgrade. Everything below the next heading is the unchanged v0.2.2 evidence.
 
@@ -54,7 +54,7 @@ Summary of what was actually run. No raw logs, account identifiers, tokens or ma
 
 ## 中文
 
-### v0.3.0 本地升级（2026-11-12，尚未打标签或发布）
+### v0.3.0 验证（2026-11-12）
 
 以下为模型路由升级实际运行过的证据；其后的 v0.2.2 记录保持原样。
 

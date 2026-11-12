@@ -37,6 +37,28 @@ Once installed, the plugin loads in future sessions.
 
 **Requirements:** Node 18+, Git, Claude Code, and logged-in `codex` and `grok` CLIs.
 
+## Update
+
+For an existing GitHub marketplace installation:
+
+```bash
+claude plugin marketplace update concord-plugin
+claude plugin update concord@concord-plugin --scope user
+```
+
+Restart Claude Code after updating. Existing runs retain their frozen routing; the new defaults apply to new runs. If your installation is named `concord@concord-local`, it uses a local marketplace: updating `concord-plugin` does not update that local source. Choose one installation method to avoid loading the plugin twice.
+
+## Release ZIP
+
+Download the self-contained [v0.3.0 marketplace ZIP](https://github.com/radowitz/concord-plugin/releases/download/v0.3.0/concord-v0.3.0.zip) from the [release page](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0), unzip it, then run from the containing directory:
+
+```bash
+claude plugin marketplace add ./concord-v0.3.0
+claude plugin install concord@concord-local --scope user
+```
+
+The ZIP includes both pinned workers, the routing-profile sample, documentation and the MIT license. It needs no npm install, build step or Python service. Checksums are attached to the release. A current Claude Code version is recommended; the native Fable worker was verified with 2.1.322.
+
 ## Usage
 
 ```text
@@ -84,7 +106,9 @@ Human approval records a decision for the exact validated working state. It does
 
 ## Versions
 
-Current version: **v0.3.0** (source version; the latest published Git tag is v0.2.2). See the [English changelog](CHANGELOG.md) or [中文更新日志](CHANGELOG.zh-CN.md) for every published version. Restart Claude Code after updating the installed plugin.
+Current release: [**v0.3.0 — Fable-first model routing**](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0).
+
+This release adds pinned Fable 5.2/high workers with an explicit Opus 5.5/xhigh backup, configurable per-user routing, daily cached discovery of official model candidates, and an advisory outcome ledger. Discovery does not automatically replace your selected models. See the [English changelog](CHANGELOG.md) or [中文更新日志](CHANGELOG.zh-CN.md) for all versions.
 
 ## From source
 

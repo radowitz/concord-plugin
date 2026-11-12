@@ -2,7 +2,6 @@
 
 [English](README.md) · **简体中文**
 
-
 Claude Code 插件（v0.3.0），在当前会话中运行多模型审议与 QA 流程：Codex 提案与编排，Grok 审议，Claude 原生编码，真实测试裁决，只读 Codex QA 把关。人始终拥有最终决定权。
 
 ```mermaid
@@ -37,6 +36,28 @@ claude plugin install concord@concord-plugin --scope user
 安装后，插件会在以后的会话中自动加载。
 
 **要求：** Node 18+、Git、Claude Code，以及已登录的 `codex` 和 `grok` CLI。
+
+## 更新
+
+已通过 GitHub marketplace 安装的用户：
+
+```bash
+claude plugin marketplace update concord-plugin
+claude plugin update concord@concord-plugin --scope user
+```
+
+更新后重启 Claude Code。已有任务保持冻结的路由，新默认规则用于新任务。如果安装名称是 `concord@concord-local`，说明它使用本地 marketplace；更新 `concord-plugin` 不会更新这个本地来源。请选择一种安装方式，避免重复加载插件。
+
+## Release ZIP 安装
+
+从[发布页面](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0)下载独立的 [v0.3.0 marketplace ZIP](https://github.com/radowitz/concord-plugin/releases/download/v0.3.0/concord-v0.3.0.zip)，解压后在其上级目录运行：
+
+```bash
+claude plugin marketplace add ./concord-v0.3.0
+claude plugin install concord@concord-local --scope user
+```
+
+ZIP 包含两套固定模型 Worker、路由配置样例、中英文说明与 MIT 许可证。无需 npm install、构建或 Python 后台服务；发布附件提供校验值。建议使用新版 Claude Code，原生 Fable Worker 已在 2.1.322 验证。
 
 ## 用法
 
@@ -85,7 +106,9 @@ claude plugin install concord@concord-plugin --scope user
 
 ## 版本
 
-当前版本：**v0.3.0**（源码版本；最近发布的 Git 标签为 v0.2.2）。各发布版本见 [中文更新日志](CHANGELOG.zh-CN.md) 或 [English changelog](CHANGELOG.md)。更新已安装的插件后，请重启 Claude Code。
+当前发布版本：[**v0.3.0 — Fable 优先的模型路由**](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0)。
+
+本版新增 Fable 5.2/high 固定模型 Worker、显式 Opus 5.5/xhigh 备选、用户级路由配置、按天缓存的官方模型候选发现，以及参考性任务结果记录。发现新模型不会自动替换你指定的模型。各版本详情见 [中文更新日志](CHANGELOG.zh-CN.md) 或 [English changelog](CHANGELOG.md)。
 
 ## 从源码加载
 
