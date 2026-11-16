@@ -1,7 +1,6 @@
-# 贞观·政事堂 · Concord — Claude Code 插件 0.4.0（源码未发布；最新发布版本 v0.3.0）
+# 贞观·政事堂 · Concord — Claude Code 插件 0.4.0（main 版本；最新标签发布为 v0.3.0）
 
 [English](README.md) · **简体中文**
-
 
 本插件（源码 0.4.0，最新发布 v0.3.0）在**当前 Claude Code 会话**中原生运行 Concord V3 流程：没有 Python 后端，没有守护进程，也不嵌套调用 `claude` CLI。一个只用 Node.js 内置模块的小助手（无 npm、无构建）提供若干短命命令：持久化状态，以只读方式调用 Codex 和 Grok，运行你的真实测试，并告诉会话下一步做什么。**代码由当前会话或其原生 Claude 子代理编写。** 唯一的例外需要你明确同意：Claude 真的达到用量上限后，可以把任务剩余的编码交给 Codex CLI（见[下文](#claude-用量上限与-codex-交接)）。
 
@@ -54,7 +53,7 @@ claude plugin install concord@concord-local
 
 ## Claude 用量上限与 Codex 交接
 
-0.4.0 新增（源码未发布；已发布版本仍为 v0.3.0）。当 Claude 真的达到用量上限时，Concord 暂停任务并**询问**是否由 Codex CLI 完成剩余的任务与修复。它使用你已有的、以 ChatGPT 登录的 Codex CLI：不接 API、不用 API key、没有 Python 守护进程、不嵌套 Claude worker、不注册钩子。没有你的明确决定就不会切换；在此之前 v0.3.0 的原生路由（Fable 5.2/high，Opus 5.5/xhigh 备选）保持不变。
+0.4.0 新增（已在 main 和 GitHub marketplace 提供；最新标签发布仍为 v0.3.0）。当 Claude 真的达到用量上限时，Concord 暂停任务并**询问**是否由 Codex CLI 完成剩余的任务与修复。它使用你已有的、以 ChatGPT 登录的 Codex CLI：不接 API、不用 API key、没有 Python 守护进程、不嵌套 Claude worker、不注册钩子。没有你的明确决定就不会切换；在此之前 v0.3.0 的原生路由（Fable 5.2/high，Opus 5.5/xhigh 备选）保持不变。
 
 交接后保持不变的内容：同一个任务、计划与任务依赖、已完成的子任务、需求及全部修订、脏工作区基线、阶段历史、测试命令，以及所有已修改的文件（写到一半的文件会作为上下文交给 Codex）。不会 stash、reset、删除、commit、merge、push 或部署。
 
@@ -99,7 +98,7 @@ node /abs/path/to/concord/scripts/concord.mjs status <run-id> --repo /abs/path/t
 | `sonnet`（普通） | 别名 `sonnet` | Agent 工具 `model: "sonnet"` |
 | `opus`（困难、高风险、风险关键词） | `fable-5.2-high` = `claude-fable-5-2`，effort `high`；声明的备选 `opus-5.5-xhigh` = `claude-opus-5-5`，effort `xhigh` | 随插件打包的代理 `concord:fable-worker` / `concord:opus-worker`，调用时**不传** `model` 参数 |
 
-- **为什么用打包代理。** Agent 工具的单次 `model` 参数只接受 `haiku`、`sonnet`、`opus`、`fable`；完整模型 ID 和 effort 只能写在代理的 frontmatter 里。因此精确版本固定在 `agents/fable-worker.md` 和 `agents/opus-worker.md` 中。固定的 ID 不会随新模型发布而变化；别名则跟随 Claude Code 当前的映射。
+- **为什么用打包代理。** Agent 工具的单次 `model` 参数只接受 `haiku`、`sonnet`、`opus`、`fable`；完整模型 ID 需要写在代理的 frontmatter 中；effort 也可按次指定，Concord 将两者一起固定在 frontmatter 中。因此精确版本固定在 `agents/fable-worker.md` 和 `agents/opus-worker.md` 中。固定的 ID 不会随新模型发布而变化；别名则跟随 Claude Code 当前的映射。
 - **默认值是用户偏好。** “困难任务优先 Fable 5.2/high，而不是 Opus 5.5/xhigh”作为内置策略保存（同时见 `policy/routing.sample.json`），并复制进每个任务。这不是基准测试结论。
 - **备选必须显式切换。** 如果宿主无法运行所请求的代理、模型或 effort（不可用、被拒绝、Claude Code 版本过旧），会话先报告确切错误，再执行动作里的 `fallback.switch` 命令（`advance --use-fallback <step> --note-file <错误>`）。切换连同原因一起记录，该步骤绝不会被说成用了首选模型。代码、测试或 QA 失败不是切换理由。显式 `--tier` 选择没有备选，会直接明确失败。
 - **主会话执行。** 只有低档、使用策略普通别名的极小任务，会话才可以自己完成（动作中的 `main_session.allowed`）。打包代理、显式 `--tier` 选择、备选、普通/困难任务和修复都必须交给所请求的代理。这是技能规则，助手无法强制；报告为 `--executor main` 的步骤记录为“继承/未知”。

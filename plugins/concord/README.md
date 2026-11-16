@@ -1,4 +1,4 @@
-# 贞观·政事堂 · Concord — Claude Code plugin 0.4.0 (unreleased source; latest release v0.3.0)
+# 贞观·政事堂 · Concord — Claude Code plugin 0.4.0 (main version; latest tagged release v0.3.0)
 
 **English** · [简体中文](https://github.com/radowitz/concord-plugin/blob/main/plugins/concord/README.zh-CN.md)
 
@@ -86,7 +86,7 @@ Helper commands are listed in `node plugins/concord/scripts/concord.mjs --help`.
 
 ## Claude usage limit and Codex handoff
 
-New in 0.4.0 (unreleased source; the published release is still v0.3.0). When Claude reaches a real usage limit, Concord pauses the run and **asks** whether Codex CLI should write the remaining tasks and repairs. It uses the Codex CLI you already have, signed in with ChatGPT: no API integration, no API key, no Python daemon, no nested Claude workers, no hooks. Without your explicit decision nothing switches, and until then the v0.3.0 native routing (Fable 5.2/high, Opus 5.5/xhigh as fallback) is unchanged.
+New in 0.4.0 (available on main and the GitHub marketplace; the latest tagged release is v0.3.0). When Claude reaches a real usage limit, Concord pauses the run and **asks** whether Codex CLI should write the remaining tasks and repairs. It uses the Codex CLI you already have, signed in with ChatGPT: no API integration, no API key, no Python daemon, no nested Claude workers, no hooks. Without your explicit decision nothing switches, and until then the v0.3.0 native routing (Fable 5.2/high, Opus 5.5/xhigh as fallback) is unchanged.
 
 What stays the same after a handoff: the run, its plan and task dependencies, completed tasks, the request and every amendment, the dirty baseline, the stage history, the test commands and every file already edited (half-written files go to Codex as context). Nothing is stashed, reset, deleted, committed, merged, pushed or deployed.
 
