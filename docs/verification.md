@@ -2,7 +2,7 @@
 
 **English** · [中文](#中文)
 
-## 0.4.0 (unreleased) verification — consented Claude → Codex handoff
+## v0.4.0 verification — consented Claude → Codex handoff
 
 What was actually run for the handoff. Everything is mocked: fake `codex`/`grok` CLIs, a fake model catalog with invented slugs, temporary git repositories. Nothing below is evidence about real provider behaviour.
 
@@ -28,7 +28,7 @@ Not verified for 0.4.0:
 - Tier routing was not run against a real account catalog inside the test suite (the committed fixtures use invented slugs); whether a selected model is usable by an account is never proven by the helper.
 - Interactive terminal consent was tested through its line reader with in-memory streams, not through a real TTY. The skill-driven question UI in a live Claude Code session was not exercised.
 - The trust boundaries are unchanged by testing: the helper cannot verify that a native writer stopped, cannot tell a human from a session passing `--decision approve`, and compares Git state before/after a writer rather than preventing changes.
-- User-scope `concord@concord-local` was updated from 0.3.0 to 0.4.0 and the installed assets were checked against source. Restart Claude Code to load the update. No live handoff or release was performed.
+- User-scope `concord@concord-local` was updated from 0.3.0 to 0.4.0 and the installed assets were checked against source. Restart Claude Code to load the update. No live handoff was performed; packaging and release publication are separate from runtime validation.
 
 ## v0.3.0 verification (2026-11-12)
 
@@ -82,7 +82,7 @@ Summary of what was actually run. No raw logs, account identifiers, tokens or ma
 
 ## 中文
 
-### 0.4.0（未发布）验证 — 经同意的 Claude → Codex 交接
+### v0.4.0 验证 — 经同意的 Claude → Codex 交接
 
 以下全部为模拟：模拟的 `codex`/`grok` CLI、使用虚构模型名的模拟目录、临时 git 仓库。这些都不能说明真实提供方的行为。
 
@@ -108,7 +108,7 @@ Summary of what was actually run. No raw logs, account identifiers, tokens or ma
 - 测试中没有用真实账号目录验证过档位路由（提交的样本使用虚构模型名）；助手永远无法证明某个账号可以使用所选模型。
 - 交互式终端同意只通过内存流测试了行读取，未在真实 TTY 中测试；真实 Claude Code 会话中由技能驱动的提问界面未验证。
 - 信任边界不因测试而改变：助手无法核实原生写入者已停止，无法区分是人还是会话传入了 `--decision approve`，对 Git 状态只做写入前后的比较而不是阻止。
-- 用户级 `concord@concord-local` 已从 0.3.0 更新至 0.4.0，并核对安装内容与源码一致；重启 Claude Code 后加载。没有运行真实接管或发布新版本。
+- 用户级 `concord@concord-local` 已从 0.3.0 更新至 0.4.0，并核对安装内容与源码一致；重启 Claude Code 后加载。没有运行真实接管；打包与发布不代表完成真实接管验证。
 
 ### v0.3.0 验证（2026-11-12）
 

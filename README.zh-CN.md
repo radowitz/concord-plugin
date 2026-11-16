@@ -4,7 +4,7 @@
 
 原生 Claude Code 多模型开发插件：**Codex 起草方案与编排，Grok 独立审议，Claude 编码，项目检查与只读 Codex QA 验证结果，最后由你审批。**
 
-**0.4.0 已在 `main` 和 GitHub marketplace 提供。** 新增 Claude 触及用量上限后、经你明确同意交接给 Codex 的选项。最近打标签的 [GitHub Release 仍是 v0.3.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0)，其 ZIP 不包含交接功能。
+**[v0.4.0 已正式发布](https://github.com/radowitz/concord-plugin/releases/tag/v0.4.0)。** 可通过 GitHub marketplace 安装，或下载[独立插件 ZIP](https://github.com/radowitz/concord-plugin/releases/download/v0.4.0/concord-v0.4.0.zip)。本版新增 Claude 触及用量上限后、经你明确同意交接给 Codex 的选项。
 
 仅使用 Node.js 内置模块，无需 Python 服务、守护进程、npm install 或嵌套 Claude CLI Worker。
 
@@ -34,6 +34,17 @@ claude plugin update concord@concord-plugin --scope user
 ```
 
 **安装或更新后重启 Claude Code。** 用户级安装会在后续会话加载，不需要每次指定插件路径。`concord@concord-local` 使用本地 marketplace，上面的 GitHub 更新命令不会更新那个本地来源。请选择一种安装来源，避免重复加载。
+
+## Release ZIP 安装
+
+下载 [concord-v0.4.0.zip](https://github.com/radowitz/concord-plugin/releases/download/v0.4.0/concord-v0.4.0.zip)，对照发布附件 `SHA256SUMS` 校验后解压，在其上级目录运行：
+
+```bash
+claude plugin marketplace add ./concord-v0.4.0
+claude plugin install concord@concord-local --scope user
+```
+
+之后重启 Claude Code。ZIP 包含安装说明、中英文文档、固定模型 Worker、路由样例和 MIT 许可证。已使用 `concord-local` 的用户应更新原来注册的本地来源，避免重复安装。
 
 ## 快速开始
 
@@ -133,8 +144,8 @@ node /absolute/plugin/scripts/concord.mjs takeover <run-id> --writer-stopped --d
 
 **169/169 项离线确定性测试通过**，使用模拟 CLI 和临时仓库。真实 Codex 编码、实际额度恢复及实时询问界面尚未完成端到端验证。历史证据包括只读原生 Fable Worker 冒烟测试，以及由 Claude 主会话编码的完整工作流。各项验证的范围与限制见[验证记录](docs/verification.md)。
 
-- **Main／marketplace：0.4.0** — 经同意的 Claude → Codex 交接；尚未创建 v0.4.0 Tag 或 GitHub Release。
-- **最近打标签的 Release：[v0.3.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0)** — Fable 优先路由，下载页仍提供该旧版本的 ZIP 与校验文件。
+- **最新 Release／Tag／marketplace：[v0.4.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.4.0)** — 经同意的 Claude → Codex 交接，附件包含插件 ZIP 与 SHA-256 校验文件。
+- **上一版 Release：[v0.3.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0)** — Fable 优先路由，旧版本下载仍保留。
 - 更新日志：[English](CHANGELOG.md) · [简体中文](CHANGELOG.zh-CN.md)。
 
 ## 从源码开发

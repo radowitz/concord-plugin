@@ -2,11 +2,11 @@
 
 **English** · [简体中文](CHANGELOG.zh-CN.md)
 
-Versions below correspond to published Git tags, except the unreleased section at the top. Documentation-only changes on `main` do not imply a new plugin release.
+Versions below correspond to published Git tags. Documentation-only changes on `main` do not imply a new plugin release.
 
-## 0.4.0 — source preview (no tag, ZIP or Release yet)
+## [0.4.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.4.0) — 2026-11-16
 
-Consented Claude → Codex handoff after a usage limit. The latest published release is still v0.3.0.
+Consented Claude → Codex handoff after a usage limit. Release assets include a self-contained marketplace ZIP and SHA-256 checksums.
 
 ### Review fixes
 

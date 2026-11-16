@@ -2,11 +2,11 @@
 
 [English](CHANGELOG.md) · **简体中文**
 
-以下版本对应已发布的 Git 标签（最上面的未发布部分除外）。`main` 上的纯文档更新不代表发布了新的插件版本。
+以下版本对应已发布的 Git 标签。`main` 上的纯文档更新不代表发布了新的插件版本。
 
-## 0.4.0 — 源码预览版（尚无标签、ZIP 或 Release）
+## [0.4.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.4.0) — 2026-11-16
 
-Claude 用量受限后，经同意交接给 Codex。最新已发布版本仍为 v0.3.0。
+Claude 用量受限后，经同意交接给 Codex。发布附件包含独立 marketplace ZIP 与 SHA-256 校验文件。
 
 ### 审查修复
 

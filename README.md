@@ -4,7 +4,7 @@
 
 A native Claude Code plugin for a multi-model development workflow: **Codex proposes and plans, Grok reviews, Claude implements, project checks and read-only Codex QA verify the result, and you approve it.**
 
-**0.4.0 is available on `main` and through the GitHub marketplace.** It adds an optional, consented handoff to Codex when Claude reaches its usage limit. The latest tagged [GitHub Release is v0.3.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0); its ZIP does not include the new handoff feature.
+**[v0.4.0 is released](https://github.com/radowitz/concord-plugin/releases/tag/v0.4.0).** Install through the GitHub marketplace or download the [self-contained plugin ZIP](https://github.com/radowitz/concord-plugin/releases/download/v0.4.0/concord-v0.4.0.zip). This version adds an optional, consented handoff to Codex when Claude reaches its usage limit.
 
 Node.js builtins only. No Python service, daemon, npm install or nested Claude CLI workers.
 
@@ -34,6 +34,17 @@ claude plugin update concord@concord-plugin --scope user
 ```
 
 **Restart Claude Code after installation or update.** User-scope installation loads in future sessions; you do not need to specify a plugin path every time. `concord@concord-local` uses a local marketplace instead: these GitHub update commands do not refresh that local source. Use one installation source to avoid duplicate loading.
+
+## Install the release ZIP
+
+Download [concord-v0.4.0.zip](https://github.com/radowitz/concord-plugin/releases/download/v0.4.0/concord-v0.4.0.zip), verify it against the release's `SHA256SUMS`, and unzip it. From the containing directory:
+
+```bash
+claude plugin marketplace add ./concord-v0.4.0
+claude plugin install concord@concord-local --scope user
+```
+
+Restart Claude Code. The ZIP includes installation instructions, both language guides, pinned workers, the routing sample and the MIT license. Existing `concord-local` users should update their registered local source instead of adding a second copy.
 
 ## Quick start
 
@@ -133,8 +144,8 @@ Use `/concord:logs` for provider stdout/stderr and normalized events. Helper sta
 
 **169/169 deterministic offline tests passed**, using fake providers and temporary repositories. Real Codex writing, actual quota recovery and the live question UI have not been verified end to end. Earlier evidence includes a read-only native Fable worker canary and a full workflow with main-session Claude implementation. See the [verification record](docs/verification.md) for the scope and limits of each check.
 
-- **Main / marketplace: 0.4.0** — consented Claude-to-Codex handoff; no v0.4.0 Tag or GitHub Release yet.
-- **Latest tagged Release: [v0.3.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0)** — Fable-first routing. Its downloadable ZIP and checksums remain available for that older version.
+- **Latest Release / tag / marketplace: [v0.4.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.4.0)** — consented Claude-to-Codex handoff, with a plugin ZIP and SHA-256 checksums attached.
+- **Previous Release: [v0.3.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0)** — Fable-first routing; its older archives remain available.
 - Changelogs: [English](CHANGELOG.md) · [简体中文](CHANGELOG.zh-CN.md).
 
 ## Develop from source

@@ -1,8 +1,8 @@
-# 贞观·政事堂 · Concord — Claude Code 插件 0.4.0（main 版本；最新标签发布为 v0.3.0）
+# 贞观·政事堂 · Concord — Claude Code 插件 v0.4.0
 
 [English](README.md) · **简体中文**
 
-本插件（源码 0.4.0，最新发布 v0.3.0）在**当前 Claude Code 会话**中原生运行 Concord V3 流程：没有 Python 后端，没有守护进程，也不嵌套调用 `claude` CLI。一个只用 Node.js 内置模块的小助手（无 npm、无构建）提供若干短命命令：持久化状态，以只读方式调用 Codex 和 Grok，运行你的真实测试，并告诉会话下一步做什么。**代码由当前会话或其原生 Claude 子代理编写。** 唯一的例外需要你明确同意：Claude 真的达到用量上限后，可以把任务剩余的编码交给 Codex CLI（见[下文](#claude-用量上限与-codex-交接)）。
+本插件（v0.4.0）在**当前 Claude Code 会话**中原生运行 Concord V3 流程：没有 Python 后端，没有守护进程，也不嵌套调用 `claude` CLI。一个只用 Node.js 内置模块的小助手（无 npm、无构建）提供若干短命命令：持久化状态，以只读方式调用 Codex 和 Grok，运行你的真实测试，并告诉会话下一步做什么。**代码由当前会话或其原生 Claude 子代理编写。** 唯一的例外需要你明确同意：Claude 真的达到用量上限后，可以把任务剩余的编码交给 Codex CLI（见[下文](#claude-用量上限与-codex-交接)）。
 
 流程：中书省 · Codex 大脑（方案）→ 门下省 · Grok 审议 → 尚书省 · Codex 编排（任务与依赖）→ 六部 · Claude Workers（当前会话或子代理，串行）→ 真实测试（argv，不经 shell）→ 御史台 · Codex QA（只读）→ 有限次 Claude 修复 → 天子决之 · 人工审批。三省六部只是组织隐喻，并非严格的历史对应；每一步同时记录真实的 provider、模型与步骤 ID。**人始终拥有最终决定权**：Concord 不会 commit、push 或部署，审批只记录与已验证工作区指纹绑定的结论。
 
@@ -53,7 +53,7 @@ claude plugin install concord@concord-local
 
 ## Claude 用量上限与 Codex 交接
 
-0.4.0 新增（已在 main 和 GitHub marketplace 提供；最新标签发布仍为 v0.3.0）。当 Claude 真的达到用量上限时，Concord 暂停任务并**询问**是否由 Codex CLI 完成剩余的任务与修复。它使用你已有的、以 ChatGPT 登录的 Codex CLI：不接 API、不用 API key、没有 Python 守护进程、不嵌套 Claude worker、不注册钩子。没有你的明确决定就不会切换；在此之前 v0.3.0 的原生路由（Fable 5.2/high，Opus 5.5/xhigh 备选）保持不变。
+[v0.4.0](https://github.com/radowitz/concord-plugin/releases/tag/v0.4.0) 新增。当 Claude 真的达到用量上限时，Concord 暂停任务并**询问**是否由 Codex CLI 完成剩余的任务与修复。它使用你已有的、以 ChatGPT 登录的 Codex CLI：不接 API、不用 API key、没有 Python 守护进程、不嵌套 Claude worker、不注册钩子。没有你的明确决定就不会切换；在此之前 v0.3.0 的原生路由（Fable 5.2/high，Opus 5.5/xhigh 备选）保持不变。
 
 交接后保持不变的内容：同一个任务、计划与任务依赖、已完成的子任务、需求及全部修订、脏工作区基线、阶段历史、测试命令，以及所有已修改的文件（写到一半的文件会作为上下文交给 Codex）。不会 stash、reset、删除、commit、merge、push 或部署。
 
