@@ -2,7 +2,7 @@
 
 [English](README.md) · **简体中文**
 
-Claude Code 插件（v0.3.0），在当前会话中运行多模型审议与 QA 流程：Codex 提案与编排，Grok 审议，Claude 原生编码，真实测试裁决，只读 Codex QA 把关。人始终拥有最终决定权。
+Claude Code 插件（源码版本 0.4.0，尚未发布；最新已发布版本 v0.3.0），在当前会话中运行多模型审议与 QA 流程：Codex 提案与编排，Grok 审议，Claude 原生编码，真实测试裁决，只读 Codex QA 把关。人始终拥有最终决定权。
 
 ```mermaid
 flowchart LR
@@ -67,6 +67,7 @@ ZIP 包含两套固定模型 Worker、路由配置样例、中英文说明与 MI
 /concord:status            # 步骤、模型、产物、下一步
 /concord:resume latest     # 重启后恢复；不会自动重跑
 /concord:logs              # 查看运行中或已结束阶段的 Codex/Grok/测试输出
+/concord:takeover          # 0.4.0：Claude 真的用量受限后，询问是否由 Codex CLI 接手剩余工作
 ```
 
 ## 架构
@@ -92,9 +93,10 @@ ZIP 包含两套固定模型 Worker、路由配置样例、中英文说明与 MI
 - **任务中途改需求：** 宿主通过内部 `amend` 记录新需求（修订号、历史、使验证失效、保留已有改动；范围变化会先重新经 Grok 审议再重新规划）。Claude Code 支持 `UserPromptSubmit` 钩子，但本插件未注册任何钩子，因此不会自动拦截聊天：只有技能指示宿主、且宿主判断你的消息修改了进行中的任务时才会调用（尽力而为的宿主行为，不保证）。普通聊天不应触发。
 - **等待与可见性：** Codex/Grok 每步默认 1800 秒（`0` 为手动等待；运行中可用 `extend` 调整）。每 30 秒的提示只是通知，不会终止步骤。各阶段作为带标签的后台 Bash 任务出现在 `/tasks`；Codex/Grok 仍是外部 CLI，不是原生 Claude 代理。原始 stdout/stderr 与规范化事件（Codex `--json`、Grok `streaming-json`）实时落盘，运行期间即可用 `/concord:logs` 查看。
 - **修复路由：** 修复默认继承相关任务中最高的档位（至少 `sonnet`；高风险为困难档，默认即 Fable 5.2/high），除非指定 `--tier repair=…`。
+- **Claude 用量受限 → 经同意后交接给 Codex（0.4.0，未发布）：** 原生步骤报告真实的 Claude 用量上限时，任务暂停，并*询问*你是否让以 ChatGPT 登录的 Codex CLI 完成剩余的任务与修复。不会自动切换：只有你明确做出的决定才算数，并且绑定到所展示的那一份提案（任务、修订号、计划、检出状态，以及冻结的低/普通/高三档 Codex 模型表）。同一个任务、计划、已完成的子任务和已修改的文件全部保留。详见 [Claude 用量上限与 Codex 交接](plugins/concord/README.zh-CN.md#claude-用量上限与-codex-交接)。
 - **轻量：** 无守护进程、无 Python、无 npm，仅用 Node 内置模块。
 - **人工掌控：** 不会自动 commit、push 或部署。
-- **验证：** 详见 [验证记录](docs/verification.md)。124 项确定性测试及只读 Fable 原生代理冒烟测试通过；一次真实原生无界面任务约 132 秒完成 Codex → Grok → Codex → Claude 主会话编码 → 项目测试 → Codex QA，已有文件与 HEAD 保持不变。交互面板、原生 Agent 编码和真实长等待控制仍未验证。
+- **验证：** 详见 [验证记录](docs/verification.md)。0.4.0 源码有 169 项离线确定性测试通过（交接功能只用模拟 CLI 覆盖；没有触发过真实的 Claude 用量上限，也没有运行过真实的 Codex 写入）。v0.3.0：124 项确定性测试及只读 Fable 原生代理冒烟测试通过；一次真实原生无界面任务约 132 秒完成 Codex → Grok → Codex → Claude 主会话编码 → 项目测试 → Codex QA，已有文件与 HEAD 保持不变。交互面板、原生 Agent 编码和真实长等待控制仍未验证。
 
 ## 失败、恢复与审批
 
@@ -102,11 +104,21 @@ ZIP 包含两套固定模型 Worker、路由配置样例、中英文说明与 MI
 
 会话重启后，用 `/concord:resume latest` 查看中断的任务；恢复不会擅自重跑模型调用，中断阶段需要明确重试。中途改需求时，直接在当前对话中告诉 Claude，由 Skill 记录修订；范围变更重新经过 Grok 审议与任务编排。这依赖宿主遵循 Skill，并非自动监听每条聊天。
 
+如果 Claude 在任务中途真的达到用量上限（0.4.0），任务会暂停而不是失败：不消耗修复轮次，也不重试。默认 `--on-claude-limit ask` 会询问你是否由 Codex CLI 接手；`--on-claude-limit stop` 只暂停。如果 Claude 会话本身被限额卡住，它无法询问你，也不会有任何弹窗：请在普通终端运行 `start` 和 `/concord:status` 打印的命令（使用字面绝对路径，无守护进程）：
+
+```bash
+node /abs/path/to/concord/scripts/concord.mjs takeover <run-id> --writer-stopped --drive --repo /abs/path/to/checkout   # 展示模型表并询问；只有输入 approve 才算同意
+node /abs/path/to/concord/scripts/concord.mjs drive <run-id> --repo /abs/path/to/checkout                        # Codex 编码 → 你的检查 → QA → 修复，直到通过验证或暂停
+node /abs/path/to/concord/scripts/concord.mjs resume <run-id> --claude --repo /abs/path/to/checkout              # 或者：等限额恢复后把该步骤交还 Claude
+```
+
+同意交接不等于批准结果，`drive` 也从不替你批准。如果 Codex 无法完成某一步（它自己的额度、登录、模型、沙箱，或回答被截断），任务会再次暂停并保留已有改动；不会自动重试，也不会换用其他模型。
+
 人工批准只记录针对已验证工作区状态的决定，不会开启新一轮编码，也不会自动提交、合并、推送或部署。这些操作需要另行提出；审批后代码再变，必须重新验证。
 
 ## 版本
 
-当前发布版本：[**v0.3.0 — Fable 优先的模型路由**](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0)。
+当前发布版本：[**v0.3.0 — Fable 优先的模型路由**](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0)。源码树为 **0.4.0（源码预览版）**：Claude 用量受限后经同意交接给 Codex。GitHub marketplace 安装当前 main 分支版本（0.4.0）；上面的 Release ZIP 仍为 v0.3.0。v0.4.0 尚无标签或 Release。
 
 本版新增 Fable 5.2/high 固定模型 Worker、显式 Opus 5.5/xhigh 备选、用户级路由配置、按天缓存的官方模型候选发现，以及参考性任务结果记录。发现新模型不会自动替换你指定的模型。各版本详情见 [中文更新日志](CHANGELOG.zh-CN.md) 或 [English changelog](CHANGELOG.md)。
 
@@ -116,7 +128,7 @@ ZIP 包含两套固定模型 Worker、路由配置样例、中英文说明与 MI
 git clone https://github.com/radowitz/concord-plugin.git
 cd concord-plugin
 claude --plugin-dir ./plugins/concord
-node --test tests/*.test.mjs   # 两套测试：claude_plugin + model-routing（离线，模拟 CLI）
+node --test tests/*.test.mjs   # 全部测试：claude_plugin、model-routing、handoff、handoff-writer（离线，模拟 CLI）
 ```
 
 文档：[插件详细说明](plugins/concord/README.zh-CN.md) · [MIT 许可证](LICENSE)

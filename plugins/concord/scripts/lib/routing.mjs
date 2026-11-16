@@ -250,6 +250,9 @@ export function loadLedger() {
  */
 export function outcomeSample(run) {
   const no = (reason) => ({ sample: null, reason });
+  // A run that was paused on a limit or handed to Codex says nothing clean about a Claude candidate: never a sample.
+  if (run.handoff) return no('run has a Codex handoff record (Codex wrote, or was proposed to write, part of it)');
+  if (run.pauses?.length) return no('run was paused (limit or writer problem)');
   if (!run.routing) return no('legacy run without frozen routing');
   if (run.status !== 'approved' || !run.validation) return no('not an approved validated run');
   if ((run.revision ?? 1) !== 1 || run.amendments?.length) return no('amended run');

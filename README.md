@@ -2,7 +2,7 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-A Claude Code plugin (v0.3.0) that runs a multi-model review-and-QA workflow inside your current session. Codex proposes and plans, Grok reviews, Claude writes the code, your real tests decide, and a read-only Codex QA gates the result. You stay the final authority.
+A Claude Code plugin (source 0.4.0, unreleased; latest published release v0.3.0) that runs a multi-model review-and-QA workflow inside your current session. Codex proposes and plans, Grok reviews, Claude writes the code, your real tests decide, and a read-only Codex QA gates the result. You stay the final authority.
 
 ```mermaid
 flowchart LR
@@ -67,6 +67,7 @@ The ZIP includes both pinned workers, the routing-profile sample, documentation 
 /concord:status            # steps, providers/models, artifacts, next action
 /concord:resume latest     # after a restart; re-runs nothing on its own
 /concord:logs              # live or finished Codex/Grok/test output of a running stage
+/concord:takeover          # 0.4.0: after a real Claude usage limit, ask whether Codex CLI takes over the rest
 ```
 
 ## Architecture
@@ -92,9 +93,10 @@ These are organizational metaphors. The current plugin executes implementation t
 - **Changing the goal mid-run:** the host records a new requirement with an internal `amend` (revision, history, validation invalidated, edits kept; scope changes get a fresh Grok review, then re-plan). Claude Code does support `UserPromptSubmit` hooks, but this plugin registers no hooks, so nothing intercepts chat automatically: the host amends only when the skill instructs it to and it judges your message modifies the active task (best-effort host behaviour, not guaranteed). Ordinary chat is not meant to amend.
 - **Waiting and visibility:** Codex/Grok steps get 1800 s by default (`0` = wait manually; `extend` changes it while running). Soft 30 s notices never kill a step. Stages run as labelled background Bash tasks in `/tasks`; Codex/Grok stay external CLIs, not native Claude agents. Raw stdout/stderr and normalised events (Codex `--json`, Grok `streaming-json`) are logged as they arrive and readable with `/concord:logs` while the stage runs.
 - **Repair routing:** repairs inherit the highest relevant task tier (at least `sonnet`; the hard tier for high risk, so Fable 5.2/high by default) unless `--tier repair=…` is set.
+- **Claude usage limit → consented Codex handoff (0.4.0, unreleased):** when a native step reports a real Claude usage limit, the run pauses and you are *asked* whether Codex CLI, signed in with ChatGPT, should write the remaining tasks and repairs. Nothing switches by itself: only your explicit decision, bound to one displayed proposal (run, revision, plan, checkout and a frozen low/normal/high Codex model table), counts. The same run, plan, completed tasks and edited files are kept. See [Claude limit and Codex handoff](plugins/concord/README.md#claude-usage-limit-and-codex-handoff).
 - **Light footprint:** no daemon, no Python, no npm; Node builtins only.
 - **Human in control:** no automatic commit, push or deploy.
-- **Validation:** [verification record](docs/verification.md): 124 deterministic tests passed; a read-only native Fable worker canary also passed. One real native headless Claude Code task completed Codex → Grok → Codex → main-session implementation → project tests → Codex QA in about 132 s, preserving pre-existing files and HEAD. Interactive UI, native Agent coding and real long-wait controls remain unverified.
+- **Validation:** [verification record](docs/verification.md): 169 deterministic offline tests pass on the 0.4.0 source (the handoff is covered with fake CLIs only; no real Claude limit and no real Codex writer run was exercised). For v0.3.0, 124 deterministic tests passed; a read-only native Fable worker canary also passed. One real native headless Claude Code task completed Codex → Grok → Codex → main-session implementation → project tests → Codex QA in about 132 s, preserving pre-existing files and HEAD. Interactive UI, native Agent coding and real long-wait controls remain unverified.
 
 ## Failures, recovery and approval
 
@@ -102,11 +104,21 @@ Failed checks or blocking QA findings return to Claude for repair, followed by f
 
 After a session restart, use `/concord:resume latest` to inspect the interrupted run. Recovery does not silently rerun a model call; an interrupted stage requires an explicit retry. To change the requirement, tell Claude in the active conversation; the skill records an amendment and scope changes go back through Grok review and planning. This depends on the host following the skill, rather than an automatic chat hook.
 
+If Claude reaches a real usage limit mid-run (0.4.0), the run pauses instead of failing: no repair round is used and nothing is retried. With the default `--on-claude-limit ask` you are asked whether Codex CLI should take over; `--on-claude-limit stop` only pauses. If the Claude session itself is blocked it cannot ask you, and nothing pops up: run the command that `start` and `/concord:status` print, in a plain terminal (literal paths, no daemon):
+
+```bash
+node /abs/path/to/concord/scripts/concord.mjs takeover <run-id> --writer-stopped --drive --repo /abs/path/to/checkout   # shows the model table, asks; only typing "approve" consents
+node /abs/path/to/concord/scripts/concord.mjs drive <run-id> --repo /abs/path/to/checkout                        # Codex writer → your checks → QA → repairs, until validated or paused
+node /abs/path/to/concord/scripts/concord.mjs resume <run-id> --claude --repo /abs/path/to/checkout              # instead: wait for the reset and give the step back to Claude
+```
+
+Consent to a handoff is not approval of the result, and `drive` never approves. If Codex cannot finish a step (its own quota, login, model, sandbox or a cut-off answer) the run pauses again with the edits kept; there is no automatic retry and no fallback model.
+
 Human approval records a decision for the exact validated working state. It does not start another coding cycle or commit, merge, push or deploy. Ask for those Git or deployment actions separately; subsequent edits require fresh validation.
 
 ## Versions
 
-Current release: [**v0.3.0 — Fable-first model routing**](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0).
+Current release: [**v0.3.0 — Fable-first model routing**](https://github.com/radowitz/concord-plugin/releases/tag/v0.3.0). The source tree is at **0.4.0 (source preview)**: consented Claude → Codex handoff after a usage limit. The GitHub marketplace installs the current main-branch version (0.4.0); the release ZIP above remains v0.3.0. There is no v0.4.0 tag or Release yet.
 
 This release adds pinned Fable 5.2/high workers with an explicit Opus 5.5/xhigh backup, configurable per-user routing, daily cached discovery of official model candidates, and an advisory outcome ledger. Discovery does not automatically replace your selected models. See the [English changelog](CHANGELOG.md) or [中文更新日志](CHANGELOG.zh-CN.md) for all versions.
 
@@ -116,7 +128,7 @@ This release adds pinned Fable 5.2/high workers with an explicit Opus 5.5/xhigh 
 git clone https://github.com/radowitz/concord-plugin.git
 cd concord-plugin
 claude --plugin-dir ./plugins/concord
-node --test tests/*.test.mjs   # both suites: claude_plugin + model-routing (offline, fake CLIs)
+node --test tests/*.test.mjs   # all suites: claude_plugin, model-routing, handoff, handoff-writer (offline, fake CLIs)
 ```
 
 Docs: [detailed plugin README](plugins/concord/README.md) · [MIT License](LICENSE)

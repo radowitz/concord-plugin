@@ -1,7 +1,7 @@
 ---
 name: resume
 description: Resume a 贞观·政事堂 · Concord run in this session after a restart or interruption — reports stale in-progress steps as interrupted (never auto re-executed) and continues the /concord:run loop. Use only when the user invokes /concord:resume.
-argument-hint: "[run-id|latest] [--retry]"
+argument-hint: "[run-id|latest] [--retry] [--claude] [--retry-codex]"
 disable-model-invocation: true
 ---
 
@@ -22,6 +22,14 @@ disable-model-invocation: true
    - `implement`, `repair` or `continue`: carry on with the loop in section 2 of
      `${CLAUDE_PLUGIN_ROOT}/skills/run/SKILL.md`. Read it first if it isn't already in context.
    - `await_human` or `none`: summarise with `H status <run-id>` and stop.
+   - `await_switch`: follow `${CLAUDE_PLUGIN_ROOT}/skills/takeover/SKILL.md` (the user decides; never you).
+   - `paused`: report `pause` (kind, class, exact error, preserved files) and stop. Only on the user's explicit
+     choice: `H resume <run-id> --claude` gives the pending step back to this session after a Claude limit reset
+     (it also ends a Codex handoff), `H resume <run-id> --retry-codex` lets an approved Codex handoff run its
+     incomplete writer step again with the same frozen model. Neither command runs anything by itself, and a
+     paused run is never retried automatically.
+   - `continue` with `owner: codex`: an approved Codex handoff owns the remaining coding. Run the stages
+     (`H advance <run-id> --one-step` in the background); never implement the step natively or send `--done`.
 
 If the helper answers `wrong_worktree`, rerun with the `--repo` it prints.
 

@@ -1,9 +1,9 @@
-# 贞观·政事堂 · Concord — Claude Code 插件 v0.3.0
+# 贞观·政事堂 · Concord — Claude Code 插件 0.4.0（源码未发布；最新发布版本 v0.3.0）
 
 [English](README.md) · **简体中文**
 
 
-本插件（v0.3.0）在**当前 Claude Code 会话**中原生运行 Concord V3 流程：没有 Python 后端，没有守护进程，也不嵌套调用 `claude` CLI。一个只用 Node.js 内置模块的小助手（无 npm、无构建）提供若干短命命令：持久化状态，以只读方式调用 Codex 和 Grok，运行你的真实测试，并告诉会话下一步做什么。**代码由当前会话或其原生 Claude 子代理编写。**
+本插件（源码 0.4.0，最新发布 v0.3.0）在**当前 Claude Code 会话**中原生运行 Concord V3 流程：没有 Python 后端，没有守护进程，也不嵌套调用 `claude` CLI。一个只用 Node.js 内置模块的小助手（无 npm、无构建）提供若干短命命令：持久化状态，以只读方式调用 Codex 和 Grok，运行你的真实测试，并告诉会话下一步做什么。**代码由当前会话或其原生 Claude 子代理编写。** 唯一的例外需要你明确同意：Claude 真的达到用量上限后，可以把任务剩余的编码交给 Codex CLI（见[下文](#claude-用量上限与-codex-交接)）。
 
 流程：中书省 · Codex 大脑（方案）→ 门下省 · Grok 审议 → 尚书省 · Codex 编排（任务与依赖）→ 六部 · Claude Workers（当前会话或子代理，串行）→ 真实测试（argv，不经 shell）→ 御史台 · Codex QA（只读）→ 有限次 Claude 修复 → 天子决之 · 人工审批。三省六部只是组织隐喻，并非严格的历史对应；每一步同时记录真实的 provider、模型与步骤 ID。**人始终拥有最终决定权**：Concord 不会 commit、push 或部署，审批只记录与已验证工作区指纹绑定的结论。
 
@@ -29,6 +29,8 @@ claude plugin install concord@concord-local
 /concord:run --test 'python3 -m pytest -q' 修复任务队列竞态   # 非 Node 项目的可选覆盖
 /concord:status
 /concord:resume latest
+/concord:run --on-claude-limit stop …   # Claude 用量受限时只暂停，不询问是否交接给 Codex（默认 ask）
+/concord:takeover                       # Claude 真的用量受限后：展示提案、询问你，只记录你的决定
 ```
 
 **要点**：
@@ -47,7 +49,43 @@ claude plugin install concord@concord-local
 - **验证**：测试与 QA 必须对应同一个工作区指纹（包含未跟踪文件，不含 `.git` 和自身状态）。没有测试或测试失败都不会通过。阻断性 QA 发现必须修复，修复轮次有上限；格式不合法的计划或 QA 输出会被拒绝；验证之后再改动代码，验证即失效。
 - **吏部选才（模型选择）**：按任务难度和风险确定能力档位：低 → `haiku` 别名，普通 → `sonnet` 别名，困难 → Fable 5.2/high，Opus 5.5/xhigh 为声明的备选（用户偏好，见下文[模型路由](#模型路由)）；主会话自行完成的步骤记录为“继承、实际模型未知”。Codex 和 Grok 默认使用账号默认模型；指定的模型会与带来源和时间戳的缓存账号列表核对；绝不编造模型 ID。
 - **快速策略**：仅限 README/CHANGELOG 或 `docs/` 下的文字文件；实际改动的路径也会检查，一旦越界即作废跳过的审议并停止运行（文件保留），`--retry` 后转为完整审议与重新编排。没有任何改动的修复会直接判为失败，不再重复测试和 QA。
-- **验证与限制**：124 项确定性测试及只读 Fable 原生代理冒烟测试通过，并有一次真实原生无界面任务完成完整模型链路（由主 Claude 会话编码）；已有文件和 HEAD 不变。交互面板、原生 Agent 编码及真实长等待控制仍未验证，完整记录位于源码仓库 `docs/verification.md`。需求修订由宿主按 Skill 调用 `amend`，本插件未注册钩子，不会自动拦截每条聊天。`extend` 与提示仅在助手存活期间有效，无守护进程；关闭助手超时不能绕过宿主限制。不支持子模块或嵌套仓库，无法观测子代理确切模型，不预检 CLI 登录，测试产生未忽略文件时无法验证。
+- **交接功能的限制（0.4.0）**：Codex 交接只用模拟 CLI 验证过；没有触发过真实的 Claude 用量上限、真实的 Codex 写入、真实的 Codex 额度错误，也没有用真实的 `codex debug models` 验证过路由。上限与 Codex 错误的识别是对文本的尽力匹配，可能漏掉某些措辞（终端里的 `takeover` 不依赖任何机器上报）。交互式同意只通过行解析器测试，未在真实终端中测试。交接无法核实原生 Claude 写入者已停止，`--writer-stopped` 只是确认；`workspace-write` 沙箱与写入前后的 Git 比较只能减少、不能排除模型命令的意外副作用。模型路由是基于提供方描述的启发式判断，描述信息不足时会使用提供方默认模型（不传 `--model`），也不能证明你的套餐包含某个模型。
+- **验证与限制**：0.4.0 源码共 169 项离线确定性测试通过（v0.3.0 为 124 项）；只读 Fable 原生代理冒烟测试通过，并有一次真实原生无界面任务完成完整模型链路（由主 Claude 会话编码）；已有文件和 HEAD 不变。交互面板、原生 Agent 编码及真实长等待控制仍未验证，完整记录位于源码仓库 `docs/verification.md`。需求修订由宿主按 Skill 调用 `amend`，本插件未注册钩子，不会自动拦截每条聊天。`extend` 与提示仅在助手存活期间有效，无守护进程；关闭助手超时不能绕过宿主限制。不支持子模块或嵌套仓库，无法观测子代理确切模型，不预检 CLI 登录，测试产生未忽略文件时无法验证。
+
+## Claude 用量上限与 Codex 交接
+
+0.4.0 新增（源码未发布；已发布版本仍为 v0.3.0）。当 Claude 真的达到用量上限时，Concord 暂停任务并**询问**是否由 Codex CLI 完成剩余的任务与修复。它使用你已有的、以 ChatGPT 登录的 Codex CLI：不接 API、不用 API key、没有 Python 守护进程、不嵌套 Claude worker、不注册钩子。没有你的明确决定就不会切换；在此之前 v0.3.0 的原生路由（Fable 5.2/high，Opus 5.5/xhigh 备选）保持不变。
+
+交接后保持不变的内容：同一个任务、计划与任务依赖、已完成的子任务、需求及全部修订、脏工作区基线、阶段历史、测试命令，以及所有已修改的文件（写到一半的文件会作为上下文交给 Codex）。不会 stash、reset、删除、commit、merge、push 或部署。
+
+**worker 或 Agent 调用触发上限，而会话仍可工作。** run 技能上报确切错误（`quota`），助手分类并暂停，会话用提问界面询问你、展示提案，并只传递你的回答：
+
+```text
+H quota <run> --step task-T2 --revision 1 --note-file <确切错误>        # → paused；用量上限 + ask → await_switch
+H takeover <run> --writer-stopped --json                              # 提案与冻结的模型表；不构成同意
+H takeover <run> --proposal hp-… --decision approve --writer-stopped  # 你的决定，绑定到该提案
+H advance <run> --one-step                                            # Codex 编码、检查、QA、修复都是助手阶段
+```
+
+**Claude 会话本身额度耗尽。** 它可能无法运行任何技能，Concord 也无法让提示自动弹出。`start` 和 `status` 会打印可直接复制的命令（使用已安装助手的绝对路径），请在普通终端运行：
+
+```bash
+node /abs/path/to/concord/scripts/concord.mjs takeover <run-id> --writer-stopped --drive --repo /abs/path/to/checkout
+node /abs/path/to/concord/scripts/concord.mjs drive <run-id> --repo /abs/path/to/checkout
+node /abs/path/to/concord/scripts/concord.mjs status <run-id> --repo /abs/path/to/checkout
+```
+
+`takeover` 打印提案，然后等待你输入 `approve` 或 `decline`。空行、其他任何输入、输入被关闭、`--json` 或非终端环境都不会记录同意。之后 `drive` 在该终端里依次运行 Codex 编码 → 你的真实检查 → 全新的只读 Codex QA → Codex 修复，直到任务通过验证、失败或暂停。没有守护进程：关闭终端即停止，被中断的写入不会自行重启。`drive` 从不替你批准；对已验证状态的 `approve` 仍是你单独做出的决定。
+
+- **按任务设置：`--on-claude-limit ask|stop`**（spec `on_claude_limit`，默认 `ask`）。`ask` 在用量上限后发出询问；`stop` 只暂停、不询问。两者都不是同意。旧版本启动的任务可以显式交接，无需重置。
+- **什么算上限。** 只有上报内容中某一行本身就是用量或订阅上限的陈述（`usage_window`），或 429 之类的限流陈述（`rate_limit`）。临时限流只暂停并给出等待/恢复指引，不提供切换。认证错误、超时、连接错误、格式错误的输出和测试失败都会被拒绝，仍按普通失败处理。需求或代码中出现“用量上限”字样不会触发任何动作。你也可以在终端里不带任何机器上报直接请求交接；它会被记录为你的请求（`source: user` / `human_report`），而不是已核实的上限。
+- **同意。** 一次决定覆盖本任务在当前修订号下剩余的任务与修复编码，且只使用所展示的模型表。它绑定到提案 ID 与摘要（任务、修订号、需求、计划、检出指纹、HEAD、分支、stash、暂存区索引、模型与 effort）：其中任何一项变化，批准都会被拒绝，需要重新生成提案。新的修订或重新规划会使同意失效。拒绝后任务保持开放；被拒绝的提案永远不能再被批准。
+- **`--writer-stopped`。** 必需。助手无法看到、核实或停止原生 Claude 写入者，也绝不向 Claude 会话发送信号；该参数只是你对“没有写入者仍在编辑”的确认。
+- **模型。** 生成提案时 Concord 读取 `codex debug models`（缓存 24 小时；只保留白名单字段，绝不保存 base instructions），并为每个档位展示一条路由：低档 → 提供方描述为快速/高效的模型，普通 → 当前主力模型，高档 → 前沿/高要求模型，effort 取模型声明支持的值（`low`/`medium`/`high`；`xhigh` 仅在你指定时使用）。描述无法提供依据时不传 `--model`，提案会如实说明。这是基于提供方描述的启发式判断，不是基准测试，不按版本或名称排序，也不能证明你的账号可以使用某个模型。可用 `--codex-routes low=<模型>[@effort],normal=…,high=…` 覆盖（会对照列表校验）。模型表在本次交接中冻结；之后发布的新模型不会改变它。列表过期或缺失时，会在你决定之前如实标明。
+- **写入者。** `codex exec --sandbox workspace-write`，approvals 为 `never`、关闭网络并强制 ChatGPT 登录；其环境中会移除 `OPENAI_API_KEY`/`CODEX_API_KEY`，API key 登录会被拒绝。不会修改你保存的 Codex 配置与登录。提案、编排和 QA 仍为只读，Grok 仍然不带工具。
+- **Codex 无法完成时。** CLI 错误、超时、失败或被截断的事件流、格式错误或 `blocked` 的报告、Codex 自己的用量上限、登录问题或模型不可用，都会暂停任务并保留改动。不重试、不换模型、不消耗修复轮次。`resume <run> --retry-codex` 在你要求时重跑同一步骤；`resume <run> --claude` 把该步骤交还 Claude（例如 Claude 限额恢复之后）。
+- **Git 状态。** 每次写入前后都会比较 HEAD、分支、stash 和暂存区索引；出现变化就暂停并报告，绝不回滚。Codex 的沙箱限制的是模型执行的命令，并不是操作系统级的保证。
+- **记录。** `status` 显示每个子任务由谁编写、冻结的模型表及其来源和时间、切换原因和每一次暂停。交接过或暂停过的任务永远不会计入 Claude 的结果记录。
 
 ## 模型路由
 
@@ -113,4 +151,4 @@ H models --reset-observations   # 删除记录
 
 限制：Concord 无法在调用 Agent 之前确认你的账号、提供方或 Claude Code 版本支持固定的模型或 effort；周转时间包含会话自身的开销；别名解析只读取文档中的别名表。
 
-测试（仅源码仓库）：`node --test tests/*.test.mjs`（同时运行 `claude_plugin.test.mjs` 与 `model-routing.test.mjs`；离线）。
+测试（仅源码仓库）：`node --test tests/*.test.mjs`（运行 `claude_plugin`、`model-routing`、`handoff`、`handoff-writer`；离线）。

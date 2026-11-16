@@ -81,7 +81,7 @@ const DISCOVERY = {
  * models visible to the signed-in account; the CLI may contact its provider to
  * do so, but no prompt or inference request is sent.
  */
-export async function refreshCatalog(bins, tmpDir) {
+export async function refreshCatalog(bins, tmpDir, { onRaw } = {}) {
   const at = new Date().toISOString();
   const providers = {};
   fs.mkdirSync(tmpDir, { recursive: true });
@@ -96,8 +96,11 @@ export async function refreshCatalog(bins, tmpDir) {
       try {
         const st = fs.statSync(outFile);
         if (st.size > d.maxBytes) throw new Error(`output too large (${st.size} bytes > ${d.maxBytes})`);
-        models = d.parse(fs.readFileSync(outFile, 'utf8'));
+        const text = fs.readFileSync(outFile, 'utf8');
+        models = d.parse(text);
         if (!models.length) error = 'no model list recognised in CLI output';
+        // Optional consumer of the same output (Codex handoff metadata): never a second CLI call, never fatal.
+        else { try { onRaw?.(name, text, at); } catch { /* advisory */ } }
       } catch (e) { error = `unparseable output: ${e.message}`; }
     }
     try { fs.unlinkSync(outFile); } catch { /* none */ }

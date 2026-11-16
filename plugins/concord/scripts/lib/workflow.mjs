@@ -10,6 +10,9 @@ export const ROLES = {
   test: { label: '测试 · 本地命令', provider: 'local' },
   qa: { label: '御史台 · Codex QA', provider: 'codex' },
   repair: { label: '六部 · Claude 修复', provider: 'claude (native)' },
+  // Only after an explicit, recorded handoff consent: the same task/repair steps, written by Codex CLI.
+  codex_task: { label: '六部 · Codex Workers (handoff)', provider: 'codex' },
+  codex_repair: { label: '六部 · Codex 修复 (handoff)', provider: 'codex' },
   approval: { label: '天子决之 · 人工审批', provider: 'human' },
 };
 export const METAPHOR = '贞观·政事堂 · Concord V3 uses 三省六部 names as an organizational metaphor, not an exact historical equivalence. The human remains the final authority; nothing is deployed or pushed.';

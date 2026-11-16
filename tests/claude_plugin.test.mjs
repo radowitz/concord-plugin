@@ -450,9 +450,9 @@ describe('packaging', () => {
     assert.ok(files.includes('concord/skills/run/SKILL.md'));
     assert.ok(files.every((f) => !/\.py$|agentflow|tests?\//.test(f)), files.join('\n'));
     const manifest = JSON.parse(fs.readFileSync(path.join(out, 'concord/.claude-plugin/plugin.json'), 'utf8'));
-    assert.equal(manifest.version, '0.3.0');
+    assert.equal(manifest.version, '0.4.0');
     // Packaged helper runs standalone.
-    assert.equal(spawnSync(process.execPath, [path.join(out, 'concord/scripts/concord.mjs'), '--version'], { encoding: 'utf8' }).stdout.trim(), '0.3.0');
+    assert.equal(spawnSync(process.execPath, [path.join(out, 'concord/scripts/concord.mjs'), '--version'], { encoding: 'utf8' }).stdout.trim(), '0.4.0');
   });
 });
 

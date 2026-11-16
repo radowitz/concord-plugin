@@ -1,8 +1,8 @@
-# 贞观·政事堂 · Concord — Claude Code plugin v0.3.0
+# 贞观·政事堂 · Concord — Claude Code plugin 0.4.0 (unreleased source; latest release v0.3.0)
 
 **English** · [简体中文](https://github.com/radowitz/concord-plugin/blob/main/plugins/concord/README.zh-CN.md)
 
-This plugin runs a Concord V3 workflow natively inside your current Claude Code session. It has no Python backend, no daemon and no nested `claude` CLI. A small Node.js helper (builtins only, no npm, no build step) runs short-lived commands. It stores durable state, calls Codex and Grok in read-only mode, runs your real tests, and tells the session what to do next. **The code is written by this session or by its native Claude subagents.**
+This plugin runs a Concord V3 workflow natively inside your current Claude Code session. It has no Python backend, no daemon and no nested `claude` CLI. A small Node.js helper (builtins only, no npm, no build step) runs short-lived commands. It stores durable state, calls Codex and Grok in read-only mode, runs your real tests, and tells the session what to do next. **The code is written by this session or by its native Claude subagents.** The one exception needs your explicit consent: after a real Claude usage limit you can hand the remaining coding of a run to Codex CLI ([details](#claude-usage-limit-and-codex-handoff)).
 
 ```text
 中书省 · Codex 大脑 (proposal) → 门下省 · Grok 审议 (review) → 尚书省 · Codex 编排 (task plan + dependencies)
@@ -53,11 +53,13 @@ claude plugin install concord@concord-local
 /concord:status            # latest run: steps, providers/models, tasks, 政事堂议事 artifacts, next action
 /concord:resume latest     # after a restart: reports interrupted steps, re-runs nothing on its own
 /concord:logs              # live/finished logs and events of a stage (read-only, works while it runs)
+/concord:run --on-claude-limit stop …   # pause on a Claude usage limit without offering a Codex handoff (default: ask)
+/concord:takeover          # after a real Claude usage limit: show the proposal, ask you, record only your decision
 ```
 
 The host records a mid-run change of goal with the internal `amend` skill; you do not type a slash command for every message.
 
-Helper commands are listed in `node plugins/concord/scripts/concord.mjs --help`. `preflight` is a free check with no inference and no network. `models --refresh` lists the models available to your account through local CLI commands. `approve <run> --decision approve|reject` records your decision. `cancel <run>` stops a run. `logs`, `extend`, `amend` and `status --light` are described below.
+Helper commands are listed in `node plugins/concord/scripts/concord.mjs --help`. `preflight` is a free check with no inference and no network. `models --refresh` lists the models available to your account through local CLI commands. `approve <run> --decision approve|reject` records your decision. `cancel <run>` stops a run. `logs`, `extend`, `amend` and `status --light` are described below; `quota`, `takeover`, `drive` and `resume --claude|--retry-codex` in [Claude usage limit and Codex handoff](#claude-usage-limit-and-codex-handoff).
 
 ## How it works
 
@@ -81,6 +83,41 @@ Helper commands are listed in `node plugins/concord/scripts/concord.mjs --help`.
   - Model discovery happens only when you ask for it.
   - This plugin registers no hooks.
   - `--policy fast` combines the proposal and plan, and skips Grok only for a narrow docs-only typo fix (README/CHANGELOG or `docs/` prose). Concord records why. The paths actually changed are checked as well: anything else invalidates the skip and stops the run, leaving files untouched, until `--retry` runs the full review and re-plan.
+
+## Claude usage limit and Codex handoff
+
+New in 0.4.0 (unreleased source; the published release is still v0.3.0). When Claude reaches a real usage limit, Concord pauses the run and **asks** whether Codex CLI should write the remaining tasks and repairs. It uses the Codex CLI you already have, signed in with ChatGPT: no API integration, no API key, no Python daemon, no nested Claude workers, no hooks. Without your explicit decision nothing switches, and until then the v0.3.0 native routing (Fable 5.2/high, Opus 5.5/xhigh as fallback) is unchanged.
+
+What stays the same after a handoff: the run, its plan and task dependencies, completed tasks, the request and every amendment, the dirty baseline, the stage history, the test commands and every file already edited (half-written files go to Codex as context). Nothing is stashed, reset, deleted, committed, merged, pushed or deployed.
+
+**A worker or the Agent call hits the limit and the session still works.** The run skill reports the exact error (`quota`), the helper classifies it and pauses, and the session asks you with its question UI, shows the proposal and passes only your answer:
+
+```text
+H quota <run> --step task-T2 --revision 1 --note-file <exact error>   # → paused; usage limit + ask → await_switch
+H takeover <run> --writer-stopped --json                              # proposal + frozen model table; no consent
+H takeover <run> --proposal hp-… --decision approve --writer-stopped  # your decision, bound to that proposal
+H advance <run> --one-step                                            # Codex writer, checks, QA, repairs as stages
+```
+
+**The Claude session itself is out of quota.** It may be unable to run any skill, and Concord cannot make a prompt appear. `start` and `status` print a ready-to-copy command with the installed helper's absolute path; run it in a plain terminal:
+
+```bash
+node /abs/path/to/concord/scripts/concord.mjs takeover <run-id> --writer-stopped --drive --repo /abs/path/to/checkout
+node /abs/path/to/concord/scripts/concord.mjs drive <run-id> --repo /abs/path/to/checkout
+node /abs/path/to/concord/scripts/concord.mjs status <run-id> --repo /abs/path/to/checkout
+```
+
+`takeover` prints the proposal and waits for you to type `approve` or `decline`. An empty line, anything else, a closed input, `--json` or a non-terminal records no consent. `drive` then runs Codex writer → your real checks → fresh read-only Codex QA → Codex repairs in that terminal until the run is validated, failed or paused. There is no daemon: closing the terminal stops it, and an interrupted writer is never restarted by itself. `drive` never approves; `approve` on the validated state stays your separate decision.
+
+- **Per run: `--on-claude-limit ask|stop`** (spec `on_claude_limit`, default `ask`). `ask` offers the question after a usage limit; `stop` pauses without offering. Neither is consent. Runs started by older versions can be handed over explicitly without being reset.
+- **What counts as a limit.** Only a reported line that is itself a usage or subscription limit statement (`usage_window`), or a rate-limit statement such as a 429 (`rate_limit`). A temporary rate limit pauses with wait/resume guidance and does not offer a switch. Authentication errors, timeouts, connection errors, malformed output and failing tests are refused and stay ordinary failures. A limit phrase inside your request or code never triggers anything. From a terminal you can also request a handoff without any machine report; it is recorded as your request (`source: user` / `human_report`), not as a verified limit.
+- **Consent.** One decision covers the remaining task and repair coding of this run at this revision, with exactly the displayed model table. It is bound to a proposal id and digest (run, revision, request, plan, checkout fingerprint, HEAD, branch, stash, staged index, models and efforts): if any of that changed, the approval is refused and a new proposal is needed. A new amendment or re-plan invalidates consent. Declining keeps the run open; a declined proposal can never be approved.
+- **`--writer-stopped`.** Required. The helper cannot see, verify or stop a native Claude writer and never sends signals to Claude sessions; the flag is your acknowledgement that none is still editing.
+- **Models.** At proposal time Concord reads `codex debug models` (cached for 24 h; only whitelisted fields, never base instructions) and shows one route per tier: low → a model the provider describes as fast/efficient, normal → the current workhorse, high → the frontier/demanding model, with the effort the model declares (`low`/`medium`/`high`; `xhigh` only when you ask for it). When the descriptions give no evidence, no `--model` is passed and the proposal says so. This is a heuristic from provider descriptions, not a benchmark, not a ranking by version or name, and not proof that your account may use a model. Override with `--codex-routes low=<model>[@effort],normal=…,high=…` (checked against the list). The table is frozen for the handoff; later model releases do not change it. A stale or missing list is shown as such before you decide.
+- **Writer.** `codex exec --sandbox workspace-write` with approvals `never`, network off and the ChatGPT login forced; `OPENAI_API_KEY`/`CODEX_API_KEY` are removed from its environment and an API-key login is refused. Your saved Codex configuration and login are not changed. Proposal, plan and QA stay read-only and Grok stays tool-less.
+- **When Codex cannot finish.** A CLI error, timeout, failed or truncated stream, a malformed or `blocked` report, Codex's own usage limit, a login problem or an unavailable model pause the run with the edits kept. Nothing is retried, no other model is tried and no repair round is used. `resume <run> --retry-codex` runs the same step again on request; `resume <run> --claude` gives the step back to Claude (for example after your Claude limit reset).
+- **Git state.** HEAD, branch, stash and the staged index are compared before and after every writer; a change pauses the run and is reported, never reverted. Codex's sandbox restricts model-run commands; it is not an operating-system guarantee.
+- **Records.** `status` shows who wrote each task, the frozen table with its source and time, the reason for the switch and every pause. A handed-off or paused run is never counted in the Claude outcome ledger.
 
 ## Model routing
 
@@ -146,18 +183,21 @@ When you approve a run, Concord records one local sample only if the run was cle
 
 Limits: Concord cannot verify that your account, provider or Claude Code version supports a pinned model or effort before the Agent call; turnaround includes the session's own overhead; the alias parser reads only the documented alias table.
 
-Details: [skills/run/REFERENCE.md](skills/run/REFERENCE.md). Tests (source repository only): `node --test tests/*.test.mjs` (runs both `claude_plugin.test.mjs` and `model-routing.test.mjs`), using fake CLIs, fixtures and temporary repositories; no network.
+Details: [skills/run/REFERENCE.md](skills/run/REFERENCE.md). Tests (source repository only): `node --test tests/*.test.mjs` (runs `claude_plugin`, `model-routing`, `handoff` and `handoff-writer`), using fake CLIs, fixtures and temporary repositories; no network.
 
 ## Limitations
 
 - This is a functional prototype. One real native headless Claude Code task reached `validated` through Codex, Grok, main-session implementation, project tests and Codex QA. The interactive UI, native Agent coding and real long-wait controls remain unverified.
 - Grok's streaming event shapes follow its public headless-mode documentation; unknown event types are counted and ignored.
 - Amendments are recorded only when the host calls `amend`; this plugin registers no hooks, so nothing watches chat messages.
-- Validation evidence (see `docs/verification.md` in the source repository): 124 deterministic tests, one native headless run, plus a standalone live Grok `streaming-json` capture (212 lines) parsed by the normaliser.
+- Validation evidence (see `docs/verification.md` in the source repository): 169 deterministic offline tests on the 0.4.0 source (124 for v0.3.0), one native headless run, plus a standalone live Grok `streaming-json` capture (212 lines) parsed by the normaliser.
+- The Codex handoff (0.4.0) is verified with fake CLIs only. No real Claude usage limit, real Codex writer run, real Codex quota error or real `codex debug models` routing was exercised; the limit patterns and Codex error patterns are best-effort matches on text and may miss a wording (the terminal `takeover` works without any machine report). Interactive consent was tested through its line parser, not a real terminal.
+- A handoff cannot verify that a native Claude writer has stopped; `--writer-stopped` is an acknowledgement. Codex's `workspace-write` sandbox and the before/after Git comparison reduce, but do not exclude, unwanted side effects of model-run commands.
+- Handoff model routing is a heuristic over provider descriptions. It can pick the provider default (no `--model`) when descriptions are uninformative, and it never proves that your plan includes a model.
 - `extend` and soft notices work only while a helper process lives; there is no daemon. Unattended Claude Code background commands normally have a 2 h maximum unless the host is configured otherwise; interactive local sessions have different host limits. A helper deadline of `0` does not override host limits.
 - It runs serially only. Parallel subagents would need separate worktrees, which are not implemented.
 - The helper cannot see which exact Claude model served a subagent.
-- Login state of `codex` and `grok` is not checked before a run.
+- Login state of `codex` and `grok` is not checked before a run (only a handoff checks `codex login status`, and only for ChatGPT).
 - Tests that write files that are not gitignored prevent validation.
 - Git submodules and nested repositories are not supported: preflight and start refuse them.
 - Linked worktrees share one run store and lock, so only one open run per repository.

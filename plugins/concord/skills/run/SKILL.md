@@ -1,7 +1,7 @@
 ---
 name: run
 description: Drive a 贞观·政事堂 · Concord (Concord V3) run step by step in this session — Codex proposal, Grok review, Codex task plan, implementation by this session or native Claude subagents, real tests, read-only Codex QA, bounded repair. Use only when the user explicitly invokes /concord:run.
-argument-hint: "[<request>] [--policy fast] [--require-clean] [--model qa=<id>] [--tier worker=fable|opus|sonnet|haiku] [--max-repairs N] [--review-timeout S|0] [--test '<cmd>']..."
+argument-hint: "[<request>] [--policy fast] [--require-clean] [--model qa=<id>] [--tier worker=fable|opus|sonnet|haiku] [--max-repairs N] [--review-timeout S|0] [--on-claude-limit ask|stop] [--test '<cmd>']..."
 disable-model-invocation: true
 ---
 
@@ -19,7 +19,7 @@ and don't run the tests yourself as a substitute.
    task the user has been discussing or just asked for, written as a self-contained request. Ask only if
    the conversation contains no goal. Never invent one, and don't require any flag.
 
-   Flag-to-spec mapping (literal flags only, e.g. `--policy`, `--model`, `--tier`, `--review-timeout`, `--test`): [REFERENCE.md](REFERENCE.md#run-flags-to-spec).
+   Flag-to-spec mapping (literal flags only, e.g. `--policy`, `--model`, `--tier`, `--review-timeout`, `--on-claude-limit ask|stop`, `--test`): [REFERENCE.md](REFERENCE.md#run-flags-to-spec).
 
 2. Pick the check that gates the run. Don't make the user type `--test`:
    1. If `--test` was given, use it as `"tests"`.
@@ -44,6 +44,8 @@ and don't run the tests yourself as a substitute.
    there). A dirty checkout is fine: the helper snapshots it as the baseline. On `dirty` (only with
    `--require-clean`), `open_run` or another error, show the message and stop. Never stash, reset, commit or
    delete the user's files to make it pass.
+5. Show the user `claude_limit.takeover_terminal` from the start output once, as the command for a plain terminal
+   if this Claude session itself ever runs out of quota (then no skill can run and nothing pops up by itself).
 
 ## 2. Loop
 
@@ -54,6 +56,8 @@ Act on the `action` of the JSON `H advance <run>` prints (last JSON document; pr
 | `continue` | Run the next helper stage (below). `next_stage` names it, its time limit and the Bash settings to use. |
 | `implement` / `repair` | Do the step (below), then record it with the action's `done` command (`advance --done <step> --executor subagent\|main --revision <revision> --one-step`) as a **background** Bash task like any helper stage: the next stage is tests (`after_done` has its limit and `timeout_ms`). |
 | `failed` | Report `failure` (`failure.kind` says timeout / stream / exit / malformed) and stop. Use `--retry` only when the user asks. |
+| `await_switch` | A real Claude usage limit paused the run (or an earlier handoff consent no longer applies). Follow the `takeover` skill: tell the user the exact error, ask them, pass only their own decision. |
+| `paused` | Nothing runs until the user decides. Report `pause` and the `message`, then stop. Don't retry, don't switch, don't offer a handoff the message says not to offer. |
 | `await_human` | Summarise and stop (see 3). |
 
 **Helper stages** (Codex proposal, Grok review, Codex plan, tests, Codex QA) can take many minutes. Run each as
@@ -85,7 +89,16 @@ To do an `implement` or `repair` step:
   declared fallback agent. Say in the final summary that the fallback ran, not the primary. With no fallback,
   record `--failed` with the error; don't retry in a loop and don't substitute a model. Failing code, tests or QA
   are never a reason to switch models.
+- **Claude usage limit.** If the Agent call or this session reports a real usage, subscription or rate limit, don't
+  retry, don't switch models and don't record `--failed`. Write the exact error text, verbatim and nothing else, with
+  Write and run the action's `on_limit.report` command (`H quota <run> --step <step> --revision <revision> --note-file <file>`).
+  The helper decides whether the text is a limit; it refuses auth errors, timeouts, connection errors and failing
+  work (`not_a_limit`: report those with `--failed`). The run becomes `paused`: no repair round is used and nothing
+  is switched. `--on-claude-limit ask` (default) leads to `await_switch`, where the user is asked whether Codex CLI
+  should take over; `stop` only pauses. That setting is never consent. After a consented handoff the action is
+  `continue` with `owner: codex`: run the stages as usual and never implement or report `--done` for such a step.
 - When you report models, say "requested" (`route.requested`): the helper never observes which model actually ran.
+  For a Codex handoff step, report the model and effort from `next_stage` / `handoff.routes` and say Codex wrote it.
 - Doing a step yourself (`--executor main`) is allowed only when the action says `main_session.allowed: true`:
   a tiny `implement` step in the low (`haiku`) tier whose model is the policy's ordinary alias. Never do it for
   a packaged agent (`agent` has no `model` key), an explicit `--tier` choice, a fallback, a normal or hard-tier

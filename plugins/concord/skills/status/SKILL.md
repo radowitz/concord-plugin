@@ -33,6 +33,11 @@ Summarise in a few lines:
 - the next action
 - routing: each task's capability tier and the *requested* candidate (`routing`, `tasks[].route`), any fallback switch (`routing.route_events`), and that the actual model is not observed
 - revision and amendments, the check's `cwd`, any check-coverage warning, and per-stage time if the user asks
+- a pause (`pause`: kind, class, source, the exact reported error, preserved files) and a Codex handoff (`handoff`:
+  status, the frozen low/normal/high model and effort table with its source and time, the reason, who consented and
+  when). Say which tasks Codex wrote (`tasks[].written_by`), that the table is a heuristic and not a benchmark, and
+  that handoff consent is not approval of the result. Give `claude_limit.takeover_terminal` when the user asks how
+  to continue if Claude itself is out of quota
 - for a running stage: step, elapsed vs limit, last output / no output yet (from `--light`)
 - if `worktree.foreign` is true the run belongs to another worktree: this is a read-only view, the working state is "unavailable" (not "invalid"), and mutating commands need `--repo <run repo>`
 
@@ -41,4 +46,5 @@ Say that nothing has been committed, pushed or deployed and that the human decid
 When the user explicitly asks to record their decision on a validated run, run
 `H approve <run-id> --decision approve` or `--decision reject`. It only records a review bound
 to the current validated fingerprint (always fully checked, even if you used `--light` before). If the files changed since validation, it refuses.
-Use `/concord:resume` to continue a run, or `H cancel <run-id>` if they ask to abandon it.
+Use `/concord:resume` to continue a run, or `H cancel <run-id>` if they ask to abandon it. A handoff decision goes
+through the `takeover` skill and is always the user's own; status never records one.

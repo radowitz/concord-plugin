@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // 贞观·政事堂 · Concord — native Claude Code plugin helper (Node builtins only).
 // Short-lived commands; durable state in <git-common-dir>/concord/runs/<id>/.
-// The current Claude Code session (or its native subagents) writes all code.
+// The current Claude Code session (or its native subagents) writes all code, unless the user explicitly
+// approves handing the remaining task/repair coding to Codex CLI (lib/handoff.mjs, lib/codex-routing.mjs).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -20,14 +21,18 @@ import { OFFICIAL_URL, TTL_MS, discoveryFile, ensureDiscovery, loadDiscovery } f
 import * as R from './lib/routing.mjs';
 import * as W from './lib/workflow.mjs';
 import { KIND_NOTE, classifyExplicit, discoverChecks } from './lib/checks.mjs';
+import * as CX from './lib/codex-routing.mjs';
+import * as HO from './lib/handoff.mjs';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const SELF = fileURLToPath(import.meta.url);
-const OPEN = new Set(['active', 'awaiting_session', 'failed', 'validated']);
+// `paused`: open, nothing running, waiting for a human decision (Claude limit, or a Codex writer that did not complete).
+const OPEN = new Set(['active', 'awaiting_session', 'failed', 'validated', 'paused']);
 const LIMITS = { cli_timeout_s: [480, 30, 3600], test_timeout_s: [300, 10, 3600], max_repairs: [2, 0, 5] };
 const DEFAULT_REVIEW_TIMEOUT_S = 1800; // per external role (Codex/Grok); 0 = no helper deadline (manual)
 const MAX_REVIEW_TIMEOUT_S = 86400;
-const SPEC_KEYS = new Set(['request', 'tests', 'tests_cwd', 'policy', 'models', 'limits', 'require_clean']);
+const SPEC_KEYS = new Set(['request', 'tests', 'tests_cwd', 'policy', 'models', 'limits', 'require_clean', 'on_claude_limit']);
+const TIMEOUT_ROLES = ['proposal', 'review', 'plan', 'qa', 'writer']; // writer = the Codex handoff writer
 const EXTERNAL = { proposal: 'codex', review: 'grok', plan: 'codex', qa: 'codex' };
 const MAX_NOTE = 4000;
 const MAX_DIFF = 150 * 1024;
@@ -86,11 +91,35 @@ Commands (all short-lived; no daemon; state in <git-dir>/concord/runs/<id>):
                                       timeline, per-stage timing. --light skips the working-state fingerprint.
   list                                List runs in this repository.
   show RUN STEP                       Print one stored artifact (bounded).
-  resume RUN                          Mark stale in-progress steps interrupted; print next action.
+  resume RUN [--claude | --retry-codex]
+                                      Mark stale in-progress steps interrupted; print next action. For a PAUSED
+                                      run: --claude hands the pending step back to the Claude session (after a
+                                      limit reset; ends any Codex handoff), --retry-codex lets an approved Codex
+                                      handoff run its interrupted/incomplete writer step again. Neither runs anything.
+  quota RUN --step STEP --revision N --note-file FILE
+                                      Record the exact limit error a native Claude step reported. The text is
+                                      classified conservatively (usage window / temporary rate limit; auth, timeouts,
+                                      connection errors and failing code are refused). The run becomes "paused":
+                                      no repair round is used, nothing is retried and nothing is switched.
+  takeover RUN --writer-stopped [--note-file F] [--codex-routes low=M[@E],normal=…,high=…] [--json]
+                                      Prepare a proposal to hand the remaining task/repair coding of this run to
+                                      Codex CLI (ChatGPT login only): checks the login, refreshes Codex model
+                                      metadata if older than a day and prints the frozen low/normal/high model
+                                      table. In a terminal it then asks; only the typed word "approve" consents.
+                                      With --json or without a terminal it never reads stdin.
+  takeover RUN --proposal ID --decision approve|decline [--writer-stopped] [--drive]
+                                      Record the human decision, bound to that exact proposal (run revision,
+                                      request, task plan, checkout and model table). A changed state needs a new
+                                      proposal. decline keeps the run open and paused. Consent is never final
+                                      approval of the result.
+  drive RUN [--one-step] [--max-steps N]
+                                      Run helper-owned stages one after another under one lock (Codex writer,
+                                      checks, QA, repairs) until validated, failed, paused or a decision is needed.
+                                      Never retries, never re-consents, never approves. No daemon: it is this process.
   interrupt RUN                       Stop the live helper's current stage (process groups killed) but keep the run
                                       OPEN: the stage is recorded interrupted; amend and/or continue afterwards.
   cancel RUN                          Stop a live helper for RUN and close the run (files untouched).
-  (advance/resume/amend/extend/interrupt/approve/cancel only work from the worktree the run was started in;
+  (advance/resume/amend/extend/interrupt/approve/cancel/quota/takeover/drive only work from the worktree the run was started in;
    from another worktree of the same repository they fail with wrong_worktree.)
   approve RUN --decision approve|reject [--note-file F]
                                       Record the human decision bound to the validated state.
@@ -102,7 +131,9 @@ Spec (JSON): {"request": str, "tests" (optional; autodetected when omitted): [["
   "policy": "full"|"fast", "models": {"proposal","review","plan","qa": id|"account_default",
   "worker","repair": "haiku"|"sonnet"|"opus"|"fable" or a routing-profile candidate key}, "limits": {"cli_timeout_s","test_timeout_s","max_repairs",
   "review_timeout_s" (default 1800; 0 = manual, no deadline), "role_timeout_s": {"proposal|review|plan|qa": s}},
-  "require_clean": false}
+  "require_clean": false, "on_claude_limit": "ask"|"stop" (default ask: when a native step reports a real Claude
+  usage limit the run pauses and the user is ASKED whether Codex CLI should take over; stop: pause without offering.
+  Never consent by itself; role_timeout_s also takes "writer" for the Codex handoff writer)}
 Test strings are split into argv (simple quotes only); shell operators are rejected. No shell is used.
 
 Env: CONCORD_CODEX_BIN, CONCORD_GROK_BIN (CLI paths), CONCORD_STATE_DIR, CONCORD_CACHE_DIR,
@@ -114,7 +145,7 @@ ${W.METAPHOR}`;
 
 function parseArgs(argv) {
   const pos = []; const opt = {};
-  const flags = new Set(['--json', '--refresh', '--retry', '--help', '-h', '--version', '--require-clean', '--light', '--one-step', '--writer-stopped', '--reset-routing', '--observations', '--reset-observations']);
+  const flags = new Set(['--json', '--refresh', '--retry', '--help', '-h', '--version', '--require-clean', '--light', '--one-step', '--writer-stopped', '--reset-routing', '--observations', '--reset-observations', '--claude', '--retry-codex', '--drive']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (flags.has(a)) opt[a.replace(/^-+/, '')] = true;
@@ -186,7 +217,7 @@ function validateSpec(spec) {
     if (!rt || typeof rt !== 'object' || Array.isArray(rt)) throw new ConcordError('limits.role_timeout_s must be an object', 'spec');
     limits.role_timeout_s = {};
     for (const [k, v] of Object.entries(rt)) {
-      if (!(k in EXTERNAL)) throw new ConcordError(`unknown limits.role_timeout_s role: ${k}`, 'spec');
+      if (!TIMEOUT_ROLES.includes(k)) throw new ConcordError(`unknown limits.role_timeout_s role: ${k}`, 'spec');
       limits.role_timeout_s[k] = secs(v, `limits.role_timeout_s.${k}`);
     }
   }
@@ -196,7 +227,9 @@ function validateSpec(spec) {
     if (typeof spec.tests_cwd !== 'string' || !spec.tests_cwd.trim() || spec.tests_cwd.includes('\0')) throw new ConcordError('spec.tests_cwd must be a repo-relative directory string', 'spec');
   }
   if (spec.require_clean !== undefined && typeof spec.require_clean !== 'boolean') throw new ConcordError('spec.require_clean must be a boolean', 'spec');
-  return { request: spec.request, tests: tests ?? null, tests_cwd: spec.tests_cwd ?? null, policy, models: m, limits, require_clean: spec.require_clean === true };
+  if (spec.on_claude_limit !== undefined && !['ask', 'stop'].includes(spec.on_claude_limit)) throw new ConcordError('spec.on_claude_limit must be "ask" or "stop"', 'spec');
+  return { request: spec.request, tests: tests ?? null, tests_cwd: spec.tests_cwd ?? null, policy, models: m, limits, require_clean: spec.require_clean === true,
+    on_claude_limit: spec.on_claude_limit ?? 'ask' };
 }
 
 // ------------------------------------------------------------------ run store
@@ -281,9 +314,11 @@ function beginStep(store, id, role, extra = {}) {
   return step;
 }
 
-function endStep(store, step, status, extra = {}) {
+/** `pause` (Codex handoff writer only): a failed step pauses the run for a human decision instead of failing it. */
+function endStep(store, step, status, extra = {}, pause = null) {
   Object.assign(step, { status, ended_at: now(), ms: Date.parse(now()) - Date.parse(step.started_at) }, extra);
-  if (status === 'failed' || status === 'cancelled' || status === 'interrupted') {
+  if (status === 'failed' && pause) setPause(store, pause);
+  else if (status === 'failed' || status === 'cancelled' || status === 'interrupted') {
     store.run.status = 'failed';
     store.run.failure = { step: step.id, attempt: step.attempt, error: step.error, kind: step.failure_class, at: step.ended_at,
       ...(status === 'interrupted' ? { interrupted: true, by_user: true } : {}) };
@@ -315,15 +350,24 @@ function markStale(store) {
 
 const EVENT_FILE_CAP = 2 * 1024 * 1024;
 
-async function runCli(store, stepId, role, prompt, schema) {
+const MAX_FINAL_BYTES = 4 * 1024 * 1024; // Codex final message (-o file)
+
+/**
+ * `writer` (approved handoff only) swaps in the dedicated writable Codex invocation: its own frozen route, argv,
+ * environment and time limit. In that mode a failure is RETURNED ({failed}) instead of ending the step, so the
+ * caller pauses the run rather than failing it, and a stream with no recognised events is rejected: the final
+ * message file alone is never evidence that a coding turn completed.
+ */
+async function runCli(store, stepId, role, prompt, schema, writer = null) {
   const r = store.run;
-  const key = stepId.replace(/-\d+$/, ''); // proposal | review | plan | qa
-  const route = r.models[key];
+  const key = writer ? 'writer' : stepId.replace(/-\d+$/, ''); // proposal | review | plan | qa | writer
+  const route = writer ? writer.route : r.models[key];
   const provider = W.ROLES[role].provider;
+  const chatgptOnly = provider === 'codex' && (writer !== null || handoffActive(r));
   const b = bins();
   let fmt = null;
   if (provider === 'grok') fmt = await grokFormat(b.grok, path.dirname(cachePath()), path.join(os.tmpdir(), `concord-grokcaps-${process.pid}`));
-  const step = beginStep(store, stepId, role, { provider, model: route.model, model_evidence: route.evidence,
+  const step = beginStep(store, stepId, role, { provider, model: route.model, model_evidence: route.evidence, ...(writer?.step ?? {}),
     ...(fmt ? { output_format: fmt.format, output_format_source: fmt.source } : {}) });
   const a = step.attempt;
   const promptFile = store.p('prompts', `${stepId}.a${a}.txt`);
@@ -341,8 +385,10 @@ async function runCli(store, stepId, role, prompt, schema) {
   const last = store.p('logs', `${stepId}.a${a}.last.txt`);
   if (provider === 'codex') {
     // --json streams JSONL events on stdout for progress/logs; the -o file stays the authoritative final message.
-    argv = [b.codex, 'exec', '--json', '--sandbox', 'read-only', '--ephemeral', '--color', 'never', '-C', store.loc.repo,
-      '--output-schema', schemaFile, '-o', last, ...modelArgs, '-'];
+    argv = writer ? writer.argv({ bin: b.codex, repo: store.loc.repo, schemaFile, last })
+      : [b.codex, 'exec', '--json', '--sandbox', 'read-only', '--ephemeral', '--color', 'never', '-C', store.loc.repo,
+        ...(chatgptOnly ? CX.CHATGPT_ARGS : []),
+        '--output-schema', schemaFile, '-o', last, ...modelArgs, '-'];
     stdinPath = promptFile;
   } else {
     // Independent review: empty temp cwd, no tools at all (`--tools ""`), a single turn;
@@ -367,10 +413,10 @@ async function runCli(store, stepId, role, prompt, schema) {
     if (!force && t - lastSave < 2000) return;
     lastSave = t; Object.assign(step, activity()); store.save();
   };
-  say(store, step.id, `▶ ${step.label} · ${provider}${route.model === 'account_default' ? '' : `:${route.model}`} — ${limitText(timeoutS0)}; ` +
+  say(store, step.id, `▶ ${step.label} · ${provider}${route.model === 'account_default' ? '' : `:${route.model}`}${writer?.banner ? ` ${writer.banner}` : ''} — ${limitText(timeoutS0)}; ` +
     `soft notices every ${Math.round(heartbeatMs() / 1000)}s never stop it. Follow: logs ${r.id} --step ${step.id}; cancel: cancel ${r.id}`);
   const res = await runProc(argv, {
-    cwd, env: process.env, stdoutPath: out, stderrPath: err, stdinPath, heartbeatMs: heartbeatMs(),
+    cwd, env: writer?.env ?? (chatgptOnly ? HO.writerEnv(process.env) : process.env), stdoutPath: out, stderrPath: err, stdinPath, heartbeatMs: heartbeatMs(),
     deadline: () => {
       const s = roleTimeoutS(store, key);
       if (s !== step.timeout_s) {
@@ -403,11 +449,14 @@ async function runCli(store, stepId, role, prompt, schema) {
   });
   if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
   Object.assign(step, activity(), { process_ms: res.ms, first_output_ms: res.firstOutputMs, pid: res.pid, events_dropped: evDropped || undefined });
-  const fail = (cls, error) => { endStep(store, step, 'failed', { error, failure_class: cls, logs }); return null; };
+  const fail = (cls, error) => {
+    if (writer) return { step, logs, norm, failed: { cls, error, exited: cls === 'exit' || cls === 'process_error', stderr: tail(err, 1500) } };
+    endStep(store, step, 'failed', { error, failure_class: cls, logs }); return null;
+  };
   if (res.error) return fail('process_error', `${res.error}: ${tail(err, 600).trim()}`.trim());
   if (res.timedOut) {
     return fail('timeout', `CLI timeout: ${step.provider} gave no final result within ${step.timeout_s}s; process group killed. This is a helper timeout, not a ${role} verdict (nothing was approved or rejected, no model was changed). ` +
-      `Retry with advance --retry, or raise limits.review_timeout_s / use extend (0 = manual wait). ${tail(err, 300).trim()}`.trim());
+      `${writer ? 'Partial edits are kept. Run it again only on the user\'s request (resume --retry-codex); limits.role_timeout_s.writer / extend change the limit' : 'Retry with advance --retry, or raise limits.review_timeout_s / use extend'} (0 = manual wait). ${tail(err, 300).trim()}`.trim());
   }
   if (res.code !== 0) return fail('exit', `exit ${res.code ?? res.signal}: ${tail(err, 600).trim()}`.trim());
   try {
@@ -416,6 +465,8 @@ async function runCli(store, stepId, role, prompt, schema) {
       if (!fs.existsSync(last)) throw new W.Malformed(`no final message file${norm.errors.length ? ` (stream error: ${norm.errors[0]})` : ''}`);
       const c = codexStreamResult(norm);
       if (c.error) return fail('stream', `malformed codex stream: ${c.error}`);
+      if (writer && norm.recognized === 0) return fail('stream', 'no recognised Codex events on stdout: a final message file alone is not evidence that the coding turn completed');
+      if (fs.statSync(last).size > MAX_FINAL_BYTES) throw new W.Malformed('final message too large');
       parsed = W.extractJson(fs.readFileSync(last, 'utf8'));
     } else if (fmt.format === 'streaming-json' && norm.recognized > 0) {
       const g = grokStreamResult(norm);
@@ -428,7 +479,7 @@ async function runCli(store, stepId, role, prompt, schema) {
       parsed = W.unwrapGrok(fs.readFileSync(out, 'utf8'));
       step.legacy_whole_json = true;
     }
-    return { step, parsed, logs };
+    return { step, parsed, logs, norm };
   } catch (e) {
     return fail('malformed', `malformed ${role} output: ${e.message}`);
   }
@@ -447,6 +498,7 @@ function accept(store, res, validate, artifactName) {
 }
 
 function setTasks(store, tasks) {
+  invalidateHandoff(store.run, 'the task plan changed');
   const ov = store.run.models.worker_override;
   const rt = store.run.routing;
   store.run.tasks = tasks.map((t) => {
@@ -586,10 +638,7 @@ const STAGES = {
       r.phase = 'test'; r.policy_notes.push(`${now()}: working state changed after tests; re-running tests before QA.`); store.save(); return;
     }
     const n = r.steps.filter((s) => s.role === 'qa').length + 1;
-    const diffAll = git(store.loc.repo, ['diff-tree', '-p', '-r', '--no-color', '--no-ext-diff', '--no-textconv', baseTree(r), currentTree(store.loc)]);
-    const diff = diffAll.length > MAX_DIFF ? `${diffAll.slice(0, MAX_DIFF)}\n…[diff truncated at ${MAX_DIFF} bytes; inspect files directly]` : diffAll || '(no changes since the run started)';
-    const had = new Set((r.baseline.dirty ?? []).filter((e) => e.xy === '??').map((e) => e.path));
-    const untracked = git(store.loc.repo, ['ls-files', '-z', '--others', '--exclude-standard']).split('\0').filter((p) => p && !had.has(p)).join('\n');
+    const { diff, untracked } = baselineDiff(store);
     const kind = KIND_NOTE[lastTest.check_kind] ? lastTest.check_kind : 'custom';
     const tests = `${lastTest.commands.map((c) => `- ${JSON.stringify(c.argv)} exit ${c.code}`).join('\n')}${kind === 'test' ? '' : `\nNOTE (kind=${kind}): ${KIND_NOTE[kind]}. Passing it is NOT evidence that behaviour was tested; verify behaviour by reading the code.`}`;
     const plan = { summary: store.readArtifact('plan')?.summary, tasks: r.tasks.map(({ id, title, files, status }) => ({ id, title, files, status })) };
@@ -622,6 +671,16 @@ const STAGES = {
  */
 const baseTree = (r) => r.baseline.work_tree || r.baseline.head;
 const currentTree = (loc) => timed('snapshot', () => snapshotTrees(loc, { staged: false }).work_tree);
+
+/** Bounded diff of the current working state against the START baseline, plus files that are new and untracked since then. */
+function baselineDiff(store) {
+  const r = store.run;
+  const diffAll = git(store.loc.repo, ['diff-tree', '-p', '-r', '--no-color', '--no-ext-diff', '--no-textconv', baseTree(r), currentTree(store.loc)]);
+  const diff = diffAll.length > MAX_DIFF ? `${diffAll.slice(0, MAX_DIFF)}\n…[diff truncated at ${MAX_DIFF} bytes; inspect files directly]` : diffAll || '(no changes since the run started)';
+  const had = new Set((r.baseline.dirty ?? []).filter((e) => e.xy === '??').map((e) => e.path));
+  const untracked = git(store.loc.repo, ['ls-files', '-z', '--others', '--exclude-standard']).split('\0').filter((p) => p && !had.has(p)).join('\n');
+  return { diff, untracked };
+}
 
 /** Paths added/modified/deleted since the START baseline (pre-existing dirty work excluded). */
 function changedPaths(store) {
@@ -662,6 +721,142 @@ function needRepair(store, cause) {
   store.save();
 }
 
+// ------------------------------------------------------------------ pause and consented Codex handoff
+
+const NATIVE_PHASES = ['implement', 'repair'];
+const CODEX_TIER = { haiku: 'low', sonnet: 'normal', opus: 'high' };
+const { onLimit, handoffActive, pendingWork, terminal } = HO; // pure helpers live in lib/handoff.mjs
+
+/** Codex tier of a step: always from the tasks' own difficulty/risk, never from a Claude --tier override. */
+function codexTier(r, w) {
+  if (w.kind === 'implement') { const { tier, reason } = routeTask(w.task, null); return { tier: CODEX_TIER[tier], reason: `task ${w.task.id}: ${reason}` }; }
+  const b = repairTier(r);
+  return { tier: CODEX_TIER[b.tier], reason: b.reason };
+}
+
+/** Record a pause on the run (not saved here). Files are only listed, never touched. */
+function setPause(store, p) {
+  const r = store.run;
+  let preserved;
+  try {
+    const paths = changedPaths(store);
+    preserved = { changed_paths: paths.slice(0, 200), total: paths.length, note: 'Changes since the run started, including partial edits of the pending step. Left exactly as they are: nothing was stashed, reset, committed or deleted.' };
+  } catch (e) { preserved = { note: `changed files could not be listed (${e.message}); nothing was touched` }; }
+  r.pause = { ...p, revision: W.revisionOf(r), at: now(), preserved };
+  r.pauses = [...(r.pauses ?? []), { kind: p.kind, class: p.class ?? null, provider: p.provider, step: p.step ?? null, at: r.pause.at }].slice(-50);
+  r.status = 'paused'; r.issued = null;
+  timeline(store, { type: 'pause', kind: p.kind, provider: p.provider, step: p.step ?? null });
+}
+
+function pauseRun(store, p) {
+  setPause(store, p); store.save();
+  say(store, p.step ?? null, `⏸ paused (${p.kind}${p.class ? `/${p.class}` : ''}): ${(p.error ?? p.report ?? '').split('\n')[0].slice(0, 160)}`);
+}
+
+/** A new revision, a new plan or a changed checkout ends the authority of an approved handoff; a pending proposal goes stale. */
+function invalidateHandoff(r, reason) {
+  const h = r.handoff;
+  if (!h) return false;
+  if (h.proposal?.status === 'proposed') Object.assign(h.proposal, { status: 'stale', stale: { at: now(), changed: [reason] } });
+  if (h.status !== 'active') return false;
+  h.status = 'invalidated';
+  h.invalidated = { at: now(), reason, revision: W.revisionOf(r) };
+  r.policy_notes.push(`${now()}: Codex handoff consent invalidated (${reason}); a new proposal and explicit consent are needed before Codex writes again.`);
+  return true;
+}
+
+/**
+ * Who has the pending task/repair once helper stages stop: Codex under an approved handoff (run stays active), nobody
+ * while a pause is unresolved or consent was invalidated (paused), otherwise the Claude session (awaiting_session).
+ */
+function settle(store) {
+  const r = store.run;
+  if (r.status !== 'active' || !NATIVE_PHASES.includes(r.phase) || handoffActive(r)) return;
+  if (r.handoff?.status === 'invalidated' && r.pause?.kind !== 'consent_required') {
+    pauseRun(store, { kind: 'consent_required', provider: 'codex', step: pendingWork(r)?.step ?? null, error: `Codex handoff consent no longer applies: ${r.handoff.invalidated?.reason ?? 'state changed'}` });
+    return;
+  }
+  r.status = r.pause ? 'paused' : 'awaiting_session';
+  store.save();
+}
+
+const recovery = (store) => HO.recovery(store.run, (...a) => cmdFor(store, ...a));
+const handoffSummary = HO.summary;
+const pausedAction = (store, base) => HO.pausedAction(store.run, base, (...a) => cmdFor(store, ...a));
+
+/**
+ * The dedicated writable stage of an approved handoff: ONE pending task or repair, written by Codex CLI with the frozen
+ * route of its tier. Every way of not completing (CLI error, failed or truncated stream, malformed or `blocked` report,
+ * Codex quota/auth/model errors, a changed Git state) PAUSES the run with the edits kept: nothing is retried, no other
+ * model is tried, no repair round is used and the step is not marked done. Completion goes through settleWork, the same
+ * guards a native step passes; a report is a coding report only, never validation.
+ */
+async function codexWriter(store) {
+  const r = store.run; const h = r.handoff; const loc = store.loc;
+  const w = pendingWork(r);
+  if (!w) throw new ConcordError(`no task or repair is pending in phase ${r.phase}`, 'internal');
+  if (h.revision !== W.revisionOf(r)) { invalidateHandoff(r, `the request is now revision ${W.revisionOf(r)}`); settle(store); return; }
+  const { tier, reason: tierReason } = codexTier(r, w);
+  const route = h.routes[tier];
+  const before = HO.gitState(loc.repo);
+  // Coding may change files after the first step; it never authorizes changes to the approved Git state.
+  const changed = [...(!h.writer_started_at && fp(loc).sha256 !== h.checkout.fingerprint ? ['working files'] : []), ...HO.gitStateDiff(h.checkout, before)];
+  if (changed.length) {
+    invalidateHandoff(r, `the checkout changed after the proposal was prepared (${changed.join(', ')})`);
+    pauseRun(store, { kind: 'checkout_changed', provider: 'codex', step: w.step, changed, error: `the checkout no longer matches the approved proposal (${changed.join(', ')}); no writer was started` });
+    return;
+  }
+  const env = HO.writerEnv(process.env);
+  const login = await HO.codexLogin(bins().codex, env);
+  if (!login.ok) {
+    pauseRun(store, { kind: 'codex_auth', provider: 'codex', class: 'auth', step: w.step, error: `${login.evidence}. The writer was not started: only a ChatGPT login is used for a handoff, never an API key.` });
+    return;
+  }
+  const role = w.kind === 'repair' ? 'codex_repair' : 'codex_task';
+  const why = h.reason?.source === 'native_report' ? `after Claude reported a ${h.reason.class === 'rate_limit' ? 'rate' : 'usage'} limit` : 'at the user\'s own request';
+  const { diff, untracked } = baselineDiff(store);
+  const prompt = HO.writerPrompt(r, { role, work: w, reason: why, diff, untracked,
+    completed: r.tasks.filter((t) => t.status === 'done').map(({ id, title, files }) => ({ id, title, files })),
+    remaining: r.tasks.filter((t) => t.status !== 'done' && t.id !== w.task?.id).map(({ id, title, depends_on }) => ({ id, title, depends_on })) });
+  const prev = [...r.steps].reverse().find((x) => x.fingerprint)?.fingerprint ?? r.baseline.fingerprint;
+  if (!h.writer_started_at) { h.writer_started_at = now(); store.save(); }
+  const res = await runCli(store, w.step, role, prompt, HO.WRITER_SCHEMA, {
+    route: { model: route.model, evidence: `${route.source}: ${route.basis}` }, env,
+    argv: (a) => HO.writerArgv({ ...a, route }),
+    banner: `@ ${route.effort ?? 'CLI default effort'} [${tier} tier; handoff from Claude ${why}]`,
+    step: { executor: 'codex_cli', effort: route.effort, codex_tier: tier, tier_reason: tierReason, route_source: route.source, handoff_proposal: h.consent.proposal, sandbox: 'workspace-write', git_before: before },
+  });
+  const step = res.step;
+  const after = HO.gitState(loc.repo);
+  const moved = HO.gitStateDiff(before, after);
+  const pause = (kind, cls, error, extra = {}) => endStep(store, step, 'failed', { error, failure_class: cls, logs: res.logs, git_after: after },
+    { kind, provider: 'codex', class: cls, step: w.step, attempt: step.attempt, model: route.model, effort: route.effort, error, ...extra });
+  if (moved.length) {
+    return pause('git_state_changed', 'git_state_changed', `the Codex writer run changed Git state (${moved.join(', ')}), which a handoff forbids. Nothing was reset or reverted; inspect it yourself.` +
+      `${res.failed ? ` The writer also did not complete: ${res.failed.error}` : ''}`, { changed: moved, git_before: before, git_after: after });
+  }
+  if (res.failed) {
+    const kind = HO.classifyCodexFailure({ events: res.norm.errors, stderr: res.failed.stderr, exited: res.failed.exited }) ?? 'writer_incomplete';
+    return pause(kind, res.failed.cls, res.failed.error);
+  }
+  let report;
+  try { report = HO.validateWriterReport(res.parsed); } catch (e) {
+    store.artifact(`${w.step}.codex.rejected.a${step.attempt}`, res.parsed);
+    return pause('writer_incomplete', 'malformed', `malformed Codex coding report rejected: ${e.message}`);
+  }
+  if (report.status !== 'completed') {
+    store.artifact(`${w.step}.codex.blocked.a${step.attempt}`, report);
+    return pause('writer_blocked', 'blocked', `Codex reported it could not complete ${w.step} (nothing was marked done): ${report.summary}`);
+  }
+  const fpNow = fp(loc).sha256;
+  endStep(store, step, 'passed', { logs: res.logs, fingerprint: fpNow, changed: fpNow !== prev, report, git_after: after,
+    artifact: store.artifact(`${w.step}.codex.a${step.attempt}`, report), note: 'Codex coding report only: not validation and not approval' });
+  settleWork(store, step, w.kind === 'repair' ? 'repair' : 'task', w.task?.id, fpNow === prev, { model: route.model, effort: route.effort, tier });
+}
+
+/** Helper-owned stage for the current phase: the fixed stages, plus the Codex writer while a handoff is approved. */
+const stageOf = (r) => STAGES[r.phase] ?? (handoffActive(r) && NATIVE_PHASES.includes(r.phase) ? codexWriter : null);
+
 // ------------------------------------------------------------------ next action
 
 function describeChecks(r) {
@@ -690,6 +885,12 @@ function repairRoute(r) {
     const o = R.routeForOverride(rt, r.models.repair_override, 'repair');
     return { tier: o.tier, reason: 'per-role override', route: o.route };
   }
+  const best = repairTier(r);
+  return { tier: best.tier, reason: best.reason, ...(rt ? { route: R.routeForTier(rt, best.tier) } : {}) };
+}
+
+/** Capability tier of the pending repair from the related tasks' own difficulty/risk (floor sonnet); no override applied. */
+function repairTier(r) {
   const files = new Set((r.repair_cause?.findings ?? []).map((f) => f.file).filter(Boolean));
   let pool = r.tasks;
   if (files.size) { const hit = r.tasks.filter((t) => t.files.some((f) => files.has(f))); if (hit.length) pool = hit; }
@@ -699,7 +900,7 @@ function repairRoute(r) {
     const rank = CLAUDE_TIERS.indexOf(tier);
     if (rank > best.rank) best = { tier, reason: `inherits ${tier} from task ${t.id} (${reason})`, rank };
   }
-  return { tier: best.tier, reason: best.reason, ...(rt ? { route: R.routeForTier(rt, best.tier) } : {}) };
+  return best;
 }
 
 /**
@@ -735,10 +936,22 @@ function nativeCall(store, step, tier, route) {
   };
 }
 
+const limitHint = (store, step, rev) => HO.limitHint(store.run, (...a) => cmdFor(store, ...a), step, rev);
+
 /** What `advance` will run next (helper-owned stage), with the limit and a suggested background-Bash setup. */
 function stageInfo(store, phase) {
   const r = store.run;
   const ph = phase ?? r.phase;
+  if (NATIVE_PHASES.includes(ph)) {
+    const w = handoffActive(r) ? pendingWork(r) : null;
+    if (!w) return null;
+    const role = w.kind === 'repair' ? 'codex_repair' : 'codex_task';
+    const { tier } = codexTier(r, w); const route = r.handoff.routes[tier];
+    const limit = roleTimeoutS(store, 'writer');
+    return { step: w.step, role, provider: 'codex', writer: true, label: W.ROLES[role].label, tier, model: route.model, effort: route.effort, route_source: route.source,
+      limit_s: limit, limit: limit === 0 ? 'none (manual; cancel to stop)' : `${limit}s`,
+      background: { run_in_background: true, timeout_ms: limit === 0 ? 7200000 : Math.min(7200000, (limit + 120) * 1000), description: `Concord ${w.step} · codex writer (handoff) · ${r.id}` } };
+  }
   const m = { proposal: r.policy === 'fast' ? 'proposal_plan' : 'proposal', review: 'review', plan: 'plan', qa: 'qa', test: 'test' }[ph];
   if (!m) return null;
   const n = r.steps.filter((s) => s.role === ph).length + 1;
@@ -759,12 +972,20 @@ function nextAction(store) {
       message: 'Run failed and is persisted. Report it to the user. Retry only if they ask: advance --retry (re-runs the failed step).', retry: cmdFor(store, 'advance', r.id, '--retry') };
   }
   if (['cancelled', 'approved', 'rejected'].includes(r.status)) return { ...base, action: 'none', message: `Run is ${r.status}.` };
+  if (r.status === 'paused') return pausedAction(store, base);
   if (r.status === 'validated') {
     const cov = r.validation?.check_coverage;
     return { ...base, action: 'await_human', validation: r.validation, revision: W.revisionOf(r),
       message: '天子决之 · 人工审批: validated. The human reviews the working tree; an approval only records review bound to this exact state. Nothing is committed, pushed or deployed.' +
         (r.validation?.check_kind && r.validation.check_kind !== 'test' ? ` Validation gate was ${r.validation.check_kind}: ${r.validation.check_note}.` : '') +
         (cov?.status === 'warning' ? ` CHECK COVERAGE WARNING (report this in your summary): ${cov.warnings.map((w) => `${w.message} [${w.files.join(', ')}]`).join(' ')}` : '') };
+  }
+  if (handoffActive(r) && NATIVE_PHASES.includes(r.phase)) {
+    // Codex owns the step: no native agent call and no `done` command are ever exposed here.
+    const drive = cmdFor(store, 'drive', r.id);
+    return { ...base, action: 'continue', owner: 'codex (approved handoff)', revision: W.revisionOf(r), next_stage: stageInfo(store),
+      message: 'Codex CLI owns the remaining task and repair coding of this run (explicit handoff consent on record). Run the next stage. Do not implement this step natively and do not report --done for it.',
+      next: cmdFor(store, 'advance', r.id, '--one-step'), drive, drive_terminal: terminal(drive), handoff: handoffSummary(r) };
   }
   if (r.phase === 'implement') {
     const done = new Set(r.tasks.filter((t) => t.status === 'done').map((t) => t.id));
@@ -778,7 +999,7 @@ function nextAction(store) {
       rules: `Edit only what this task needs in the current checkout. Do not commit, stash, reset, push or run destructive git commands. ${W.PRESERVE_RULE} Do not run the configured tests as a substitute for Concord validation. Work to the effective request (revision ${rev}), including every amendment.`,
       baseline: W.summarizeBaseline(r.baseline),
       done: cmdFor(store, 'advance', r.id, '--done', id, '--executor', 'subagent|main', '--revision', String(rev), '--one-step'),
-      after_done: stageInfo(store, 'test'),
+      after_done: stageInfo(store, 'test'), on_limit: limitHint(store, id, rev),
       progress: `${done.size}/${r.tasks.length} tasks done` };
   }
   if (r.phase === 'repair') {
@@ -791,7 +1012,7 @@ function nextAction(store) {
       rules: `Fix only the reported failures/findings in the current checkout. Do not commit, stash, reset or push. ${W.PRESERVE_RULE} Work to the effective request (revision ${rev}), including every amendment.`,
       baseline: W.summarizeBaseline(r.baseline),
       done: cmdFor(store, 'advance', r.id, '--done', id, '--executor', 'subagent|main', '--revision', String(rev), '--one-step'),
-      after_done: stageInfo(store, 'test') };
+      after_done: stageInfo(store, 'test'), on_limit: limitHint(store, id, rev) };
   }
   const stage = stageInfo(store);
   return { ...base, action: 'continue', message: 'Helper-owned steps remain; run advance again.', next_stage: stage,
@@ -930,7 +1151,7 @@ async function cmdStart(loc, opt) {
       schema: 1, id, version: VERSION, created_at: now(), repo: loc.repo, request: spec.request, revision: 1, amendments: [], tests: spec.tests,
       test_selection: selection, requested_policy: spec.policy, policy, policy_notes: notes, limits: spec.limits, models, routing,
       catalog: catalog ? { refreshed_at: catalog.refreshed_at, source: cachePath() } : null,
-      require_clean: spec.require_clean,
+      require_clean: spec.require_clean, on_claude_limit: spec.on_claude_limit,
       baseline: { head: headR.stdout.trim(), fingerprint: fp(loc).sha256, clean: dirty.length === 0, dirty,
         index_tree: trees.index_tree, work_tree: trees.work_tree, ref: pinned ? baseRef : null },
       status: 'active', phase: 'proposal', steps: [], tasks: [], repairs_used: 0, validation: null, approval: null, failure: null,
@@ -940,7 +1161,7 @@ async function cmdStart(loc, opt) {
     writeJson(store.p('spec.json'), raw);
     const baseline = W.summarizeBaseline(store.run.baseline);
     return { run: id, status: 'active', policy, policy_notes: notes, baseline, checks: describeChecks(store.run), limits: store.run.limits, state_dir: store.dir,
-      routing: routingSummary(store.run),
+      routing: routingSummary(store.run), claude_limit: recovery(store),
       next_stage: stageInfo(store), next: cmdFor(store, 'advance', id, '--one-step') };
   });
 }
@@ -950,63 +1171,76 @@ async function cmdAdvance(loc, id, opt) {
   // model and in the same breath record work that never ran on it.
   const native = ['done', 'failed', 'use-fallback'].filter((k) => opt[k] !== undefined);
   if (native.length > 1) throw new ConcordError(`${native.map((k) => `--${k}`).join(' and ')} cannot be combined; nothing was changed. Run one advance per action`, 'usage');
-  return withLock(loc, id, async (lock) => {
-    const store = new Store(loc, id); store.load();
-    const r = store.run;
-    if (opt.done || opt.failed || opt['use-fallback']) checkRevision(r, opt); // before anything is written
-    const stale = markStale(store);
-    if (lock.stale) r.policy_notes.push(`${now()}: replaced stale lock from pid ${lock.stale.pid}`);
-    if (stale.length && !opt.retry) {
-      return { ...nextAction(store), interrupted: stale, message: `Interrupted step(s) ${stale.join(', ')} were not re-executed. Use advance --retry to run them again.` };
+  return withLock(loc, id, (lock) => { const store = new Store(loc, id); store.load(); return advanceLocked(loc, store, lock, opt); });
+}
+
+/** One advance under an already-held lock. Shared by `advance` and `drive`; it never takes the lock itself. */
+async function advanceLocked(loc, store, lock, opt) {
+  const r = store.run;
+  if (opt.done || opt.failed || opt['use-fallback']) checkRevision(r, opt); // before anything is written
+  const stale = markStale(store);
+  if (lock.stale) r.policy_notes.push(`${now()}: replaced stale lock from pid ${lock.stale.pid}`);
+  if (stale.length && !opt.retry) {
+    return { ...nextAction(store), interrupted: stale, message: `Interrupted step(s) ${stale.join(', ')} were not re-executed. Use advance --retry to run them again.` };
+  }
+  if (['cancelled', 'approved', 'rejected'].includes(r.status)) return nextAction(store);
+  const nativeReport = opt.done || opt.failed || opt['use-fallback'];
+  if (r.status === 'paused') {
+    // A paused run moves only on an explicit human decision: no spawn, no retry, no late native report.
+    if (nativeReport || opt.retry) {
+      throw new ConcordError(`run is paused (${r.pause?.kind ?? 'unknown'}); nothing was recorded or re-run. It continues only on an explicit decision: resume --claude, resume --retry-codex, or takeover`, 'paused');
     }
-    if (['cancelled', 'approved', 'rejected'].includes(r.status)) return nextAction(store);
-    if (opt.retry) {
-      if (r.status !== 'failed') throw new ConcordError('nothing to retry: run has not failed', 'usage');
-      if (r.failure?.error?.startsWith('repair budget exhausted')) throw new ConcordError('repair budget exhausted; start a new run or fix manually', 'usage');
-      if (r.failure?.rejected_by_review) r.phase = 'review';
-      if (r.failure?.fast_gate) {
-        r.policy = 'full'; r.phase = 'review'; r.tasks = []; r.repair_cause = null;
-        r.policy_notes.push(`${now()}: retry after fast gate failure: switching to full policy (Grok review of current changes, then re-plan).`);
-      }
-      r.policy_notes.push(`${now()}: explicit retry of ${r.failure?.step}`);
-      r.status = 'active'; r.failure = null; store.save();
+    return nextAction(store);
+  }
+  if (nativeReport && handoffActive(r)) {
+    throw new ConcordError('Codex CLI owns the remaining task and repair coding of this run (handoff consent on record). A native --done/--failed/--use-fallback is not accepted and nothing was recorded', 'handoff_active');
+  }
+  if (opt.retry) {
+    if (r.status !== 'failed') throw new ConcordError('nothing to retry: run has not failed', 'usage');
+    if (r.failure?.error?.startsWith('repair budget exhausted')) throw new ConcordError('repair budget exhausted; start a new run or fix manually', 'usage');
+    if (r.failure?.rejected_by_review) r.phase = 'review';
+    if (r.failure?.fast_gate) {
+      r.policy = 'full'; r.phase = 'review'; r.tasks = []; r.repair_cause = null;
+      r.policy_notes.push(`${now()}: retry after fast gate failure: switching to full policy (Grok review of current changes, then re-plan).`);
     }
-    if (opt.failed) {
-      const na = nextAction(store);
-      if (na.step !== opt.failed) throw new ConcordError(`--failed ${opt.failed} does not match the pending step ${na.step ?? '(none)'}`, 'usage');
-      r.steps.push({ id: opt.failed, attempt: 1, revision: W.revisionOf(r), role: na.action === 'repair' ? 'repair' : 'task', label: W.ROLES[na.action === 'repair' ? 'repair' : 'task'].label,
-        provider: 'claude (native)', status: 'failed', at: now(), error: readNote(opt['note-file']) || 'session reported failure' });
-      r.status = 'failed'; r.failure = { step: opt.failed, error: 'Claude session reported it could not complete this step', at: now() };
-      r.issued = null;
-      store.save();
-      return nextAction(store);
-    }
-    if (opt['use-fallback']) useFallback(store, opt);
-    if (opt.done) recordDone(store, opt);
-    if (r.status === 'validated' && fp(loc).sha256 !== r.validation.fingerprint) {
-      r.policy_notes.push(`${now()}: working state changed after validation; validation invalidated, re-testing.`);
-      r.invalidated = [...(r.invalidated ?? []), { ...r.validation, at: now() }];
-      r.validation = null; r.status = 'active'; r.phase = 'test'; store.save();
-    }
-    // --budget S stops starting new stages once S seconds (plus the next stage's limit) would be exceeded; sized for
-    // a foreground Bash call (cap 600 s). Default: unbounded. --one-step runs exactly one stage, so each background task maps to one labelled stage.
-    const budget = Number(opt.budget ?? 0) * 1000;
-    const started = Date.now(); let ran = 0;
-    const perf0 = JSON.parse(JSON.stringify(perf));
-    while (r.status === 'active' && STAGES[r.phase]) {
-      const cost = (r.phase === 'test' ? r.tests.length * r.limits.test_timeout_s : roleTimeoutS(store, r.phase)) * 1000;
-      if (ran && opt['one-step'] === true) break;
-      if (ran && budget > 0 && Date.now() - started + cost > budget) break;
-      await STAGES[r.phase](store); ran++;
-    }
-    if (r.status === 'active' && ['implement', 'repair'].includes(r.phase)) { r.status = 'awaiting_session'; store.save(); }
-    const timing = { ms: Date.now() - started, stages_run: ran,
-      scans: { fingerprint: { count: perf.fingerprint.count - perf0.fingerprint.count, ms: perf.fingerprint.ms - perf0.fingerprint.ms },
-        snapshot: { count: perf.snapshot.count - perf0.snapshot.count, ms: perf.snapshot.ms - perf0.snapshot.ms } } };
-    r.perf_total = Object.fromEntries(['fingerprint', 'snapshot'].map((k) => [k, { count: (r.perf_total?.[k]?.count ?? 0) + timing.scans[k].count, ms: (r.perf_total?.[k]?.ms ?? 0) + timing.scans[k].ms }]));
+    r.policy_notes.push(`${now()}: explicit retry of ${r.failure?.step}`);
+    r.status = 'active'; r.failure = null; store.save();
+  }
+  if (opt.failed) {
+    const na = nextAction(store);
+    if (na.step !== opt.failed) throw new ConcordError(`--failed ${opt.failed} does not match the pending step ${na.step ?? '(none)'}`, 'usage');
+    r.steps.push({ id: opt.failed, attempt: 1, revision: W.revisionOf(r), role: na.action === 'repair' ? 'repair' : 'task', label: W.ROLES[na.action === 'repair' ? 'repair' : 'task'].label,
+      provider: 'claude (native)', status: 'failed', at: now(), error: readNote(opt['note-file']) || 'session reported failure' });
+    r.status = 'failed'; r.failure = { step: opt.failed, error: 'Claude session reported it could not complete this step', at: now(), native_report: true };
+    r.issued = null;
     store.save();
-    return { ...issue(store, nextAction(store)), timing };
-  });
+    return nextAction(store);
+  }
+  if (opt['use-fallback']) useFallback(store, opt);
+  if (opt.done) recordDone(store, opt);
+  if (r.status === 'validated' && fp(loc).sha256 !== r.validation.fingerprint) {
+    r.policy_notes.push(`${now()}: working state changed after validation; validation invalidated, re-testing.`);
+    r.invalidated = [...(r.invalidated ?? []), { ...r.validation, at: now() }];
+    r.validation = null; r.status = 'active'; r.phase = 'test'; store.save();
+  }
+  // --budget S stops starting new stages once S seconds (plus the next stage's limit) would be exceeded; sized for
+  // a foreground Bash call (cap 600 s). Default: unbounded. --one-step runs exactly one stage, so each background task maps to one labelled stage.
+  const budget = Number(opt.budget ?? 0) * 1000;
+  const started = Date.now(); let ran = 0;
+  const perf0 = JSON.parse(JSON.stringify(perf));
+  while (r.status === 'active' && stageOf(r)) {
+    const cost = (r.phase === 'test' ? r.tests.length * r.limits.test_timeout_s : roleTimeoutS(store, STAGES[r.phase] ? r.phase : 'writer')) * 1000;
+    if (ran && opt['one-step'] === true) break;
+    if (ran && budget > 0 && Date.now() - started + cost > budget) break;
+    await stageOf(r)(store); ran++;
+  }
+  settle(store);
+  const timing = { ms: Date.now() - started, stages_run: ran,
+    scans: { fingerprint: { count: perf.fingerprint.count - perf0.fingerprint.count, ms: perf.fingerprint.ms - perf0.fingerprint.ms },
+      snapshot: { count: perf.snapshot.count - perf0.snapshot.count, ms: perf.snapshot.ms - perf0.snapshot.ms } } };
+  r.perf_total = Object.fromEntries(['fingerprint', 'snapshot'].map((k) => [k, { count: (r.perf_total?.[k]?.count ?? 0) + timing.scans[k].count, ms: (r.perf_total?.[k]?.ms ?? 0) + timing.scans[k].ms }]));
+  store.save();
+  return { ...issue(store, nextAction(store)), timing };
 }
 
 /**
@@ -1089,24 +1323,243 @@ function recordDone(store, opt) {
   const step = { id: opt.done, attempt: r.steps.filter((s) => s.id === opt.done).length + 1, role, label: W.ROLES[role].label,
     provider: 'claude (native)', executor, model, ...timing, status: 'passed', at: now(), fingerprint: fpNow, changed: fpNow !== prev, revision: W.revisionOf(r), note: readNote(opt['note-file']) };
   r.steps.push(step);
-  if (role === 'repair' && fpNow === prev) {
+  settleWork(store, step, role, na.task?.id, fpNow === prev);
+}
+
+/**
+ * Completion of a task or repair step, shared by the native `--done` path and the Codex writer's own validated path:
+ * the no-op repair guard, the fast-policy path gate, then the task/repair bookkeeping.
+ */
+function settleWork(store, step, role, taskId, unchanged, codex = null) {
+  const r = store.run;
+  if (role === 'repair' && unchanged) {
     // A repair that changed nothing would only replay the same tests/QA: stop here.
     Object.assign(step, { status: 'failed', error: 'repair left the working state unchanged (same fingerprint as the failed validation)' });
     r.status = 'failed';
-    r.failure = { step: opt.done, attempt: step.attempt, at: now(), noop_repair: true,
-      error: `${opt.done} reported done but changed no files; tests/QA were not re-run. Make the fix, then advance --retry to get the repair step again.` };
+    r.failure = { step: step.id, attempt: step.attempt, at: now(), noop_repair: true,
+      error: `${step.id} reported done but changed no files; tests/QA were not re-run. Make the fix, then advance --retry to get the repair step again.` };
     store.save();
     return;
   }
-  if (!fastGate(store, opt.done)) return;
-  if (na.action === 'implement') {
-    r.tasks.find((t) => t.id === na.task.id).status = 'done';
-    if (r.tasks.every((t) => t.status === 'done')) r.phase = 'test';
+  if (!fastGate(store, step.id)) return;
+  if (role === 'task') {
+    const t = r.tasks.find((x) => x.id === taskId);
+    t.status = 'done';
+    if (codex) t.codex = codex; // written by Codex CLI under the handoff, with this frozen route
+    if (r.tasks.every((x) => x.status === 'done')) r.phase = 'test';
   } else {
     r.repairs_used += 1; r.repair_cause = null; r.phase = 'test';
   }
   r.status = 'active';
   store.save();
+}
+
+// ------------------------------------------------------------------ quota, takeover, drive, resume
+
+/**
+ * `quota`: the session reports the exact limit error of the pending native step. Only a recognised usage window or
+ * temporary rate limit pauses the run; everything else is refused untouched (that is what --failed is for).
+ */
+async function cmdQuota(loc, id, opt) {
+  if (!opt.step) throw new ConcordError('quota needs --step STEP --revision N --note-file FILE (the exact limit error text)', 'usage');
+  return withLock(loc, id, (lock) => {
+    const store = new Store(loc, id); store.load();
+    const r = store.run;
+    checkRevision(r, opt); // before anything is written
+    if (lock.stale) r.policy_notes.push(`${now()}: replaced stale lock from pid ${lock.stale.pid}`);
+    markStale(store);
+    if (handoffActive(r)) throw new ConcordError('Codex CLI owns the remaining coding of this run (handoff consent on record); a Claude limit report does not apply and nothing was recorded', 'handoff_active');
+    if (r.status === 'paused') throw new ConcordError(`run is already paused (${r.pause?.kind}); nothing was recorded`, 'paused');
+    const w = ['awaiting_session', 'active'].includes(r.status) ? pendingWork(r) : null;
+    if (!w || w.step !== opt.step) throw new ConcordError(`quota --step ${opt.step} does not match a pending native step (${w?.step ?? `none: run is ${r.status}/${r.phase}`}); nothing was recorded`, 'usage');
+    const report = (readNote(opt['note-file']) ?? '').trim();
+    if (!report) throw new ConcordError('quota needs --note-file with the exact limit error text, verbatim', 'usage');
+    const c = HO.classifyLimit(report);
+    if (!['usage_window', 'rate_limit'].includes(c.class)) {
+      throw new ConcordError(`not recorded as a Claude limit: the text reads as "${c.class}" (${c.basis}). Nothing was changed. An auth error, timeout, connection error or failing work is reported with advance --failed. ` +
+        'If it really was a usage limit, put the exact error line alone in the note file; the user can also request a handoff themselves with takeover', 'not_a_limit', { class: c.class });
+    }
+    pauseRun(store, { kind: 'claude_limit', provider: 'claude', class: c.class, source: 'native_report', step: w.step, report, matched: c.matched,
+      verified: 'pattern match on the reported text only; the helper cannot query Claude usage' });
+    r.policy_notes.push(`${now()}: ${w.step} paused on a reported Claude ${c.class === 'rate_limit' ? 'rate limit' : 'usage limit'} (on_claude_limit: ${onLimit(r)}); nothing was switched and no repair round was used.`);
+    store.save();
+    return nextAction(store);
+  });
+}
+
+const takeoverTarget = (r) => HO.takeoverTarget(r, OPEN.has(r.status));
+const remainingPlan = (r, w, routes) => HO.remainingPlan(r, w, routes, (t) => CODEX_TIER[routeTask(t, null).tier]);
+
+/** Prepare a proposal: guard, lock, then the only side effects (login probe, model metadata) and a persisted proposal. No consent. */
+async function takeoverPrepare(loc, id, opt) {
+  if (opt['writer-stopped'] !== true) {
+    throw new ConcordError('takeover needs --writer-stopped: your acknowledgement that no native Claude writer (this session or an Agent subagent) is still editing this checkout. ' +
+      'The helper cannot see or stop one, and it never sends signals to Claude sessions. Nothing was changed', 'writer_may_be_active');
+  }
+  let overrides;
+  try { overrides = CX.parseRouteOverrides(opt['codex-routes']); } catch (e) { throw new ConcordError(`${e.message}. Nothing was changed`, 'usage'); }
+  return withLock(loc, id, async (lock) => {
+    const store = new Store(loc, id); store.load();
+    const r = store.run;
+    if (lock.stale) { r.policy_notes.push(`${now()}: replaced stale lock from pid ${lock.stale.pid}`); store.save(); }
+    const stale = markStale(store);
+    if (stale.length) {
+      throw new ConcordError(`helper step(s) ${stale.join(', ')} were left running by a helper that no longer exists; they are now recorded as interrupted and were not re-run. ` +
+        'Takeover only covers a pending native task/repair: decide about that stage first (advance --retry re-runs it only when you ask)', 'stale_helper', { interrupted: stale });
+    }
+    if (handoffActive(r) && r.status === 'active') throw new ConcordError('a Codex handoff is already approved for this run; continue it with drive (or advance --one-step). Nothing was changed', 'handoff_active');
+    const w = takeoverTarget(r);
+    const note = (readNote(opt['note-file']) ?? '').trim();
+    // From here on: local CLI probes only (no inference). API keys are stripped first.
+    const b = bins(); const env = HO.writerEnv(process.env);
+    const login = await HO.codexLogin(b.codex, env);
+    if (!login.ok) throw new ConcordError(`${login.evidence}. A handoff only uses Codex CLI signed in with ChatGPT (run \`codex login\`); API-key billing is never used. Nothing was prepared`, 'codex_auth', { login: login.method });
+    const disc = await CX.ensureMetadata(b.codex, { env });
+    let routes;
+    try { routes = CX.routeTiers(disc.cache?.models ?? null, overrides); } catch (e) { throw new ConcordError(`${e.message}. Nothing was prepared`, 'codex_route'); }
+    const checkout = { fingerprint: fp(loc).sha256, ...HO.gitState(loc.repo) };
+    const reason = r.pause?.kind === 'claude_limit' ? { source: r.pause.source, class: r.pause.class, report: r.pause.report, verified: r.pause.verified }
+      : note ? { source: 'human_report', class: HO.classifyLimit(note).class, report: note, verified: 'reported by the person running takeover; not machine-verified' }
+        : { source: 'user', class: null, report: null, verified: 'explicit human request; no limit report' };
+    const p = HO.buildProposal({ runState: r, work: w, routes, catalog: CX.catalogInfo(disc), checkout, reason, login, remaining: remainingPlan(r, w, routes) });
+    const h = r.handoff ?? { schema: 1, status: 'proposed', history: [] };
+    if (!['active', 'invalidated'].includes(h.status)) h.status = 'proposed';
+    h.proposal = p;
+    h.history = [...(h.history ?? []), { at: now(), event: 'proposed', proposal: p.id }].slice(-50);
+    r.handoff = h;
+    store.save();
+    timeline(store, { type: 'handoff.proposed', proposal: p.id, step: w.step });
+    const decide = (d) => cmdFor(store, 'takeover', r.id, '--proposal', p.id, '--decision', d, ...(d === 'approve' ? ['--writer-stopped'] : []));
+    const text = HO.proposalText(p, { approve: terminal(decide('approve')), decline: terminal(decide('decline')), runId: r.id });
+    return { run: r.id, status: r.status, phase: r.phase, action: 'await_switch', consent: 'none', proposal: HO.publicProposal(p), text,
+      approve: decide('approve'), decline: decide('decline'),
+      message: 'Nothing was switched. Show the proposal text to the user and pass ONLY their own explicit decision (question UI or their typed answer). Do not approve for them: silence, a timeout, a default, on_claude_limit or your own judgment is not consent. approve is bound to this proposal; any change to the run or checkout needs a new one.' };
+  });
+}
+
+/** Record approve/decline for one prepared proposal. approve re-derives the binding from the CURRENT state and must match. */
+async function takeoverDecide(loc, id, opt, by) {
+  if (!['approve', 'decline'].includes(opt.decision)) throw new ConcordError('--decision approve|decline is required (with --proposal ID)', 'usage');
+  if (typeof opt.proposal !== 'string' || !/^hp-[a-f0-9]{16}$/.test(opt.proposal)) throw new ConcordError('--decision needs --proposal ID exactly as printed by takeover; consent is never recorded without a bound proposal', 'usage');
+  if (opt.decision === 'approve' && opt['writer-stopped'] !== true) {
+    throw new ConcordError('approve needs --writer-stopped: the acknowledgement that no native Claude writer is still editing. The helper cannot verify or stop one. Nothing was changed', 'writer_may_be_active');
+  }
+  return withLock(loc, id, (lock) => {
+    const store = new Store(loc, id); store.load();
+    const r = store.run; const h = r.handoff; const p = h?.proposal;
+    if (lock.stale) { r.policy_notes.push(`${now()}: replaced stale lock from pid ${lock.stale.pid}`); store.save(); }
+    if (!p || p.id !== opt.proposal) throw new ConcordError(`proposal ${opt.proposal} is not the current proposal of this run (${p ? `current: ${p.id}, ${p.status}` : 'none prepared'}). Nothing was changed; run takeover again and decide on what it prints`, 'stale_proposal');
+    if (p.status !== 'proposed') throw new ConcordError(`proposal ${p.id} is ${p.status}; it can no longer be decided. Nothing was changed; run takeover again for a new proposal`, 'stale_proposal', { proposal_status: p.status });
+    const record = (event) => { h.history = [...(h.history ?? []), { at: now(), event, proposal: p.id, by }].slice(-50); };
+    if (opt.decision === 'decline') {
+      p.status = 'declined'; p.decided = { decision: 'decline', at: now(), by };
+      if (h.status === 'proposed') h.status = 'declined';
+      record('declined');
+      r.policy_notes.push(`${now()}: Codex handoff proposal ${p.id} declined; the run stays open and nothing was switched.`);
+      store.save(); timeline(store, { type: 'handoff.declined', proposal: p.id });
+      return { ...nextAction(store), consented: false, declined: p.id };
+    }
+    const stale = markStale(store);
+    if (stale.length) throw new ConcordError(`helper step(s) ${stale.join(', ')} were found interrupted; nothing was approved. Decide about that stage first`, 'stale_helper', { interrupted: stale });
+    if (handoffActive(r) && r.status === 'active') throw new ConcordError('a Codex handoff is already approved for this run. Nothing was changed', 'handoff_active');
+    takeoverTarget(r);
+    const checkout = { fingerprint: fp(loc).sha256, ...HO.gitState(loc.repo) };
+    const binding = HO.bindingOf(r, checkout, p.routes, p.nonce);
+    if (HO.digestOf(binding) !== p.digest) {
+      const changed = HO.bindingDiff(p.binding, binding);
+      Object.assign(p, { status: 'stale', stale: { at: now(), changed } });
+      record('stale');
+      store.save();
+      throw new ConcordError(`proposal ${p.id} no longer matches the run: ${changed.join(', ') || 'state'} changed since it was prepared. No consent was recorded. Run takeover again and decide on the new proposal`, 'stale_proposal', { changed });
+    }
+    const from = r.status;
+    p.status = 'approved'; p.decided = { decision: 'approve', at: now(), by };
+    Object.assign(h, { status: 'active', revision: W.revisionOf(r), routes: p.routes, catalog: p.catalog, checkout: p.checkout, reason: p.reason, login: p.login, writer_started_at: null, invalidated: null,
+      consent: { decision: 'approve', proposal: p.id, digest: p.digest, at: now(), by, writer_stopped_ack: true, scope: p.scope,
+        note: 'An explicit decision bound to this proposal. The helper cannot tell who typed it and cannot verify that the native writer stopped.' } });
+    record('approved');
+    r.status = 'active'; r.pause = null; r.issued = null;
+    if (from === 'failed') r.failure = null;
+    r.policy_notes.push(`${now()}: handoff approved (${p.id}): remaining task/repair coding switched from Claude to Codex CLI (ChatGPT login). Reason: ${p.reason.source}${p.reason.class ? `/${p.reason.class}` : ''}. ` +
+      `Frozen routes: ${CX.CODEX_TIERS.map((t) => `${t}→${CX.routeLabel(p.routes[t])}`).join('; ')}. Not an approval of the result.`);
+    store.save();
+    timeline(store, { type: 'handoff.approved', proposal: p.id, from_status: from });
+    return { ...nextAction(store), consented: true, approved: p.id };
+  });
+}
+
+async function cmdTakeover(loc, id, opt) {
+  if (opt.decision !== undefined || opt.proposal !== undefined) {
+    const res = await takeoverDecide(loc, id, opt, 'explicit --decision on the command line');
+    return res.consented && opt.drive === true ? cmdDrive(loc, id, {}) : res;
+  }
+  const prep = await takeoverPrepare(loc, id, opt);
+  // --json and anything that is not a real terminal never read stdin: the decision then has to be a second, explicit command.
+  if (opt.json === true || process.stdin.isTTY !== true || process.stderr.isTTY !== true) return prep;
+  process.stderr.write(`${prep.text}\n\n`);
+  const answer = await HO.askConsent('Type "approve" to hand the remaining coding to Codex CLI, or "decline" to leave the run as it is.\nAnything else (or closing the input) records no decision: ');
+  const st = terminal(cmdFor(new Store(loc, id), 'status', id));
+  if (!answer) return `No decision recorded: only the typed words approve or decline count. Run ${id} is unchanged.\nStatus: ${st}`;
+  const res = await takeoverDecide(loc, id, { proposal: prep.proposal.id, decision: answer, 'writer-stopped': true }, 'typed at the interactive terminal prompt');
+  if (!res.consented) return `Declined. Run ${id} stays open and nothing was switched.\nStatus: ${st}`;
+  if (opt.drive === true) return cmdDrive(loc, id, {});
+  return `Consent recorded for proposal ${res.approved}: Codex CLI now owns the remaining task and repair coding of run ${id}.\nThis is not approval of the result. Continue (no daemon; this terminal runs it):\n  ${res.drive_terminal}\nStatus: ${st}`;
+}
+
+/**
+ * `drive`: helper-owned stages one after another under ONE lock (no nested locking), until a human is needed. It never
+ * passes --retry, never prepares or records consent and never approves; with no approved handoff it stops at the first
+ * step that belongs to the Claude session.
+ */
+async function cmdDrive(loc, id, opt) {
+  const max = opt['one-step'] === true ? 1 : opt['max-steps'] === undefined ? 200 : Number(opt['max-steps']);
+  if (!Number.isInteger(max) || max < 1 || max > 1000) throw new ConcordError('--max-steps must be an integer in 1..1000', 'usage');
+  return withLock(loc, id, async (lock) => {
+    const store = new Store(loc, id); store.load();
+    const trace = []; let last = null; let why = 'max_steps';
+    for (let i = 0; i < max; i++) {
+      last = await advanceLocked(loc, store, i === 0 ? lock : { ...lock, stale: null }, { 'one-step': true });
+      const ran = last.timing?.stages_run ?? 0;
+      trace.push({ action: last.action, status: last.status, phase: last.phase, stages_run: ran });
+      if (last.action !== 'continue') { why = last.action; break; }
+      if (!ran) { why = 'no_progress'; break; }
+    }
+    return { ...last, drive: { iterations: trace.length, stopped_because: why, trace: trace.slice(-30),
+      note: 'drive never retries a failed or interrupted stage, never records consent and never approves the result.' } };
+  });
+}
+
+/** `resume`: report stale steps; with --claude / --retry-codex also resolve a PAUSE by explicit human choice. Runs nothing. */
+function cmdResume(loc, id, opt) {
+  if (opt.claude === true && opt['retry-codex'] === true) throw new ConcordError('--claude and --retry-codex cannot be combined; nothing was changed', 'usage');
+  return withLock(loc, id, (lock) => {
+    const store = new Store(loc, id); store.load();
+    const r = store.run;
+    if (lock.stale) { r.policy_notes.push(`${now()}: replaced stale lock from pid ${lock.stale.pid}`); store.save(); }
+    const stale = markStale(store);
+    if (opt.claude === true || opt['retry-codex'] === true) {
+      if (r.status !== 'paused') throw new ConcordError(`run is ${r.status}, not paused; --claude / --retry-codex only resolve a pause. Nothing was changed`, 'not_paused');
+      const p = r.pause ?? {}; const h = r.handoff;
+      if (opt.claude === true) {
+        if (h && ['active', 'invalidated', 'proposed'].includes(h.status)) {
+          if (h.proposal?.status === 'proposed') Object.assign(h.proposal, { status: 'stale', stale: { at: now(), changed: ['the pending step was given back to Claude'] } });
+          Object.assign(h, { status: 'ended', ended: { at: now(), reason: 'the user resumed the pending step with Claude' } });
+        }
+        r.policy_notes.push(`${now()}: pause (${p.kind}) resolved by an explicit resume --claude: ${p.step ?? 'the pending step'} goes back to the Claude session.`);
+        r.pause = null; r.issued = null; r.status = 'awaiting_session';
+      } else {
+        if (p.provider !== 'codex') throw new ConcordError(`this pause (${p.kind}) is not a Codex writer pause; use resume --claude or takeover. Nothing was changed`, 'usage');
+        if (!handoffActive(r) || ['consent_required', 'checkout_changed'].includes(p.kind)) {
+          throw new ConcordError('the Codex handoff consent no longer applies to the current state; a retry needs a new proposal and explicit consent (takeover). Nothing was changed', 'consent_required');
+        }
+        r.policy_notes.push(`${now()}: explicit retry of Codex writer step ${p.step} after pause (${p.kind}); same frozen route, nothing else changed.`);
+        r.pause = null; r.status = 'active';
+      }
+      store.save();
+      timeline(store, { type: 'pause.resolved', by: opt.claude === true ? 'resume --claude' : 'resume --retry-codex', kind: p.kind });
+    }
+    return { ...issue(store, nextAction(store)), interrupted: stale, ...(stale.length ? { message: `Interrupted step(s) ${stale.join(', ')} recorded; not re-executed. advance --retry runs them again.` } : {}) };
+  });
 }
 
 function summarizeDiscussion(store) {
@@ -1169,10 +1622,11 @@ function cmdStatus(loc, id, opt) {
     amendments: W.amendmentsOf(r).slice(-5),
     baseline: r.baseline.head, baseline_state: W.summarizeBaseline(r.baseline), working_state: fpNow, working_state_check: verification,
     validation: r.validation ? { ...r.validation, current: fpNow === null ? null : r.validation.fingerprint === fpNow, verification } : null,
-    approval: r.approval, failure: r.failure, helper_running: helper ? helper.pid : null, running,
-    steps: r.steps.map(({ id: sid, attempt, label, provider, model, status, ms, error, reason, executor, revision, pid, last_output_at, bytes, event_counts, no_output, process_ms, failure_class, logs, timeout_s, cwd, output_format, turnaround_ms }) =>
-      ({ id: sid, attempt, label, provider, model, status, ms, error, reason, executor, revision, pid, turnaround_ms, last_output_at, bytes, event_counts, no_output, process_ms, failure_class, timeout_s, cwd, output_format, has_logs: !!logs })),
-    tasks: r.tasks.map(({ id: tid, title, status, tier, tier_reason, computed_tier, route }) => ({ id: tid, title, status, tier, tier_reason, computed_tier,
+    approval: r.approval, failure: r.failure, pause: r.pause ?? null, handoff: handoffSummary(r), claude_limit: OPEN.has(r.status) ? recovery(store) : { on_claude_limit: onLimit(r) },
+    helper_running: helper ? helper.pid : null, running,
+    steps: r.steps.map(({ id: sid, attempt, label, provider, model, effort, codex_tier, status, ms, error, reason, executor, revision, pid, last_output_at, bytes, event_counts, no_output, process_ms, failure_class, logs, timeout_s, cwd, output_format, turnaround_ms }) =>
+      ({ id: sid, attempt, label, provider, model, effort, codex_tier, status, ms, error, reason, executor, revision, pid, turnaround_ms, last_output_at, bytes, event_counts, no_output, process_ms, failure_class, timeout_s, cwd, output_format, has_logs: !!logs })),
+    tasks: r.tasks.map(({ id: tid, title, status, tier, tier_reason, computed_tier, route, codex }) => ({ id: tid, title, status, tier, tier_reason, computed_tier, ...(codex ? { written_by: 'codex (handoff)', codex } : {}),
       ...(route ? { route: { candidate: route.candidate, requested: route.label, source: route.source, reason: route.reason, fallback: route.fallback, fallback_used: route.fallback_used === true } } : {}) })),
     routing: routingSummary(r),
     checks: describeChecks(r), check_coverage: r.validation?.check_coverage ?? r.check_coverage ?? null,
@@ -1193,12 +1647,12 @@ function cmdStatus(loc, id, opt) {
     ...(report.amendments.length ? ['amendments:', ...report.amendments.map((a) => `  r${a.revision} [${a.kind}] ${a.text.split('\n')[0].slice(0, 160)}`)] : []),
     'steps:',
     ...r.steps.map((s) => {
-      const model = typeof s.model === 'string' ? s.model : s.model ? `requested ${s.model.requested ?? s.model.requested_alias}${s.model.fallback_used ? ' (FALLBACK)' : ''} [${s.executor}; actual not observed]` : '';
+      const model = typeof s.model === 'string' ? `${s.model}${s.executor === 'codex_cli' ? ` @ ${s.effort ?? 'default effort'} [${s.codex_tier} tier, handoff]` : ''}` : s.model ? `requested ${s.model.requested ?? s.model.requested_alias}${s.model.fallback_used ? ' (FALLBACK)' : ''} [${s.executor}; actual not observed]` : '';
       const live = s.status === 'running' ? ` elapsed ${fmtS(Date.now() - Date.parse(s.started_at))}${s.timeout_s !== undefined ? `, ${limitText(s.timeout_s)}` : ''}${s.pid ? `, pid ${s.pid}` : ''}${s.no_output ? ', no output yet' : s.last_output_at ? `, last output ${s.last_output_at}` : ''}` : '';
       return `  ${mark[s.status] ?? '?'} ${s.id}${s.attempt > 1 ? `#${s.attempt}` : ''}  ${s.label} · ${s.provider}${model ? `:${model}` : ''}${s.ms ? ` ${(s.ms / 1000).toFixed(1)}s` : ''}${live}${s.reason ? ` — ${s.reason}` : ''}${s.error ? ` — ${s.error.split('\n')[0].slice(0, 200)}` : ''}`;
     }),
   ];
-  if (r.tasks.length) lines.push('tasks:', ...r.tasks.map((t) => `  [${t.status}] ${t.id} ${t.title} → ${t.tier} tier (${t.tier_reason})${t.route ? `; requested ${t.route.label}${t.route.fallback_used ? ' [FALLBACK in use]' : t.route.fallback ? ` [fallback ${t.route.fallback}]` : ''} — ${t.route.source}` : ''}`));
+  if (r.tasks.length) lines.push('tasks:', ...r.tasks.map((t) => `  [${t.status}] ${t.id} ${t.title} → ${t.tier} tier (${t.tier_reason})${t.codex ? `; WRITTEN BY Codex CLI ${t.codex.model} @ ${t.codex.effort ?? 'default effort'} (handoff)` : ''}${t.route ? `; requested ${t.route.label}${t.route.fallback_used ? ' [FALLBACK in use]' : t.route.fallback ? ` [fallback ${t.route.fallback}]` : ''} — ${t.route.source}` : ''}`));
   const ro = report.routing;
   if (ro.frozen) {
     lines.push(`routing: policy "${ro.policy}" (${ro.policy_source}) frozen ${ro.frozen_at}; ${CLAUDE_TIERS.map((k) => `${k}→${ro.tiers[k].primary}${ro.tiers[k].fallback ? `|${ro.tiers[k].fallback}` : ''}`).join(', ')}`,
@@ -1215,6 +1669,7 @@ function cmdStatus(loc, id, opt) {
   if (st.length) lines.push(`stage time: ${st.map(([k, v]) => `${k} ${v.attempts}× ${fmtS(v.total_ms)}`).join('; ')}${r.perf_total ? `; scans: fingerprint ${r.perf_total.fingerprint.count}× ${fmtS(r.perf_total.fingerprint.ms)}` : ''}`);
   if (report.timeline.length) lines.push('recent:', ...report.timeline.slice(-6).map((e) => `  ${e.at.slice(11, 19)} ${e.type}${e.step ? ` ${e.step}` : ''}${e.status ? ` ${e.status}` : ''}${e.ms ? ` ${fmtS(e.ms)}` : ''}`));
   if (r.failure) lines.push(`failure: ${r.failure.step}: ${r.failure.error}`);
+  lines.push(...HO.statusLines(r, report, OPEN.has(r.status)));
   if (r.approval) lines.push(`approval: ${r.approval.decision} at ${r.approval.at} (record only; nothing deployed)`);
   lines.push(`next: ${report.next.action}${report.next.step ? ` ${report.next.step}` : ''}`, `state: ${store.dir}`);
   return lines.join('\n');
@@ -1279,7 +1734,8 @@ async function cmdAmend(loc, id, opt) {
       markStale(store);
       if (!OPEN.has(r.status)) throw new ConcordError(`run is ${r.status}; only an open run can be amended. Start a new run for new work`, 'not_open');
       if ((r.amendments?.length ?? 0) >= MAX_AMENDMENTS) throw new ConcordError(`amendment limit (${MAX_AMENDMENTS}) reached; start a new run`, 'usage');
-      const writerPossible = r.status === 'awaiting_session' || (r.status === 'active' && ['implement', 'repair'].includes(r.phase));
+      // Under an approved handoff the writer is a helper process: the lock above already proves it is not running.
+      const writerPossible = !handoffActive(r) && (r.status === 'awaiting_session' || (r.status === 'active' && ['implement', 'repair'].includes(r.phase)));
       if (writerPossible && opt['writer-stopped'] !== true) {
         throw new ConcordError('a native writer (this session or an Agent subagent) may still be editing for the pending implement/repair step; the helper cannot see or stop it. ' +
           'Stop or await it first (TaskStop / wait for the Agent), then re-run amend with --writer-stopped. Edits it already made are kept.', 'writer_may_be_active');
@@ -1319,6 +1775,11 @@ async function cmdAmend(loc, id, opt) {
       }
       if (r.status === 'validated') r.status = 'active';
       effects.push(`future Codex/Grok/QA prompts and worker actions carry revision ${rev}; stale --done results are rejected`);
+      if (r.handoff || r.pause) {
+        // Consent was for the old revision: Codex writes nothing more until the user consents again.
+        if (invalidateHandoff(r, `amended to revision ${rev}`)) effects.push('Codex handoff consent invalidated: a new takeover proposal and explicit consent are required before Codex writes again');
+        settle(store);
+      }
       store.save();
       timeline(store, { type: 'amend', revision: rev, kind });
       return { run: id, amended: { revision: rev, kind, previous_revision: old }, effects, baseline_untouched: true, ...nextAction(store) };
@@ -1489,6 +1950,17 @@ function routingLines(rr) {
   return lines;
 }
 
+/** Local read only: the cached Codex metadata and the routes a handoff proposal would show right now. */
+function codexHandoffReport() {
+  const c = CX.loadMetadata();
+  const scoped = c?.scope === CX.CHATGPT_SCOPE;
+  const routes = CX.routeTiers(c?.models ?? null);
+  if (!scoped) for (const route of Object.values(routes)) route.verified = false;
+  return { file: CX.metadataFile(), ...CX.catalogInfo(c ? { cache: c, state: 'cached', stale: !c.fetched_at || Date.now() - Date.parse(c.fetched_at) >= CX.TTL_MS } : null),
+    last_failure: c?.last_failure ?? null, routes,
+    note: `Preview only: a handoff proposal obtains an OpenAI/ChatGPT-scoped list when the cached list has another provider scope or is older than a day, then freezes its own table. ${CX.HEURISTIC_NOTE}` };
+}
+
 function observationsReport() {
   let policy;
   try { policy = R.loadPolicy({ discovered: (loadDiscovery()?.aliases ?? []).map((a) => a.alias) }); } catch (e) { throw new ConcordError(e.message, 'routing_policy'); }
@@ -1522,9 +1994,13 @@ async function cmdModels(opt) {
   if (opt.refresh) claudeRefresh = await ensureDiscovery({ force: true }).then((x) => ({ state: x.state, error: x.error ?? null }), (e) => ({ state: 'failed', error: e.message }));
   const rr = routingReport();
   const extra = { routing: rr, ...(claudeRefresh ? { claude_docs_refresh: claudeRefresh } : {}) };
-  const catalog = opt.refresh ? await refreshCatalog(bins(), path.join(os.tmpdir(), `concord-models-${process.pid}`)) : loadCatalog();
+  const catalog = opt.refresh ? await refreshCatalog(bins(), path.join(os.tmpdir(), `concord-models-${process.pid}`), { onRaw: (name, text, at) => { if (name === 'codex') CX.storeFromRaw(text, at); } }) : loadCatalog();
+  const ch = codexHandoffReport();
+  extra.codex_handoff = ch;
   if (opt.json) return { ...(catalog ?? { providers: null, note: 'no cache; run models --refresh' }), ...extra };
-  const tail2 = [...(claudeRefresh ? [`Claude published-alias refresh: ${claudeRefresh.state}${claudeRefresh.error ? ` — ${claudeRefresh.error}` : ''}`] : []), ...routingLines(rr)];
+  const tail2 = [...(claudeRefresh ? [`Claude published-alias refresh: ${claudeRefresh.state}${claudeRefresh.error ? ` — ${claudeRefresh.error}` : ''}`] : []), ...routingLines(rr),
+    `Codex handoff routing (used only after an explicit takeover consent; preview from ${ch.fetched_at ? `${ch.source} @ ${ch.fetched_at}${ch.stale ? ', STALE' : ''}` : 'no cached model list'}):`,
+    ...CX.routeLines(ch.routes), `  ${CX.HEURISTIC_NOTE}`];
   if (!catalog) return [`No model cache at ${cachePath()}. External roles use each CLI's account default.\nRun \`models --refresh\` to list account models via local CLIs. Claude capability tiers: ${CLAUDE_TIERS.join(', ')}.`, ...tail2].join('\n');
   const age = catalogAge(catalog);
   const lines = [`Model catalog ${cachePath()} (refreshed ${catalog.refreshed_at}, ${Math.round(age / 3600)}h ago${age > TTL_S ? ', STALE' : ''})`];
@@ -1568,12 +2044,11 @@ async function main(argv) {
     case 'extend': { const rid = resolveRunId(loc, pos[1]); guardRepo(loc, rid, cmd); return cmdExtend(loc, rid, opt); }
     case 'interrupt': { const rid = resolveRunId(loc, pos[1]); guardRepo(loc, rid, cmd); return cmdInterrupt(loc, rid); }
     case 'logs': return cmdLogs(loc, resolveRunId(loc, pos[1]), opt);
-    case 'resume': { const rid = resolveRunId(loc, pos[1]); guardRepo(loc, rid, cmd); return withLock(loc, rid, (lock) => {
-      const store = new Store(loc, rid); store.load();
-      if (lock.stale) { store.run.policy_notes.push(`${now()}: replaced stale lock from pid ${lock.stale.pid}`); store.save(); }
-      const stale = markStale(store);
-      return { ...issue(store, nextAction(store)), interrupted: stale, ...(stale.length ? { message: `Interrupted step(s) ${stale.join(', ')} recorded; not re-executed. advance --retry runs them again.` } : {}) };
-    }); }
+    case 'resume': { const rid = resolveRunId(loc, pos[1]); guardRepo(loc, rid, cmd); return cmdResume(loc, rid, opt); }
+    // Worktree guard first: a wrong checkout fails before any lock, log, login probe, model discovery or write.
+    case 'quota': { const rid = resolveRunId(loc, pos[1]); guardRepo(loc, rid, cmd); return cmdQuota(loc, rid, opt); }
+    case 'takeover': { const rid = resolveRunId(loc, pos[1]); guardRepo(loc, rid, cmd); return cmdTakeover(loc, rid, opt); }
+    case 'drive': { const rid = resolveRunId(loc, pos[1]); guardRepo(loc, rid, cmd); return cmdDrive(loc, rid, opt); }
     case 'status': return cmdStatus(loc, resolveRunId(loc, pos[1]), opt);
     case 'list': return listRuns(loc).map((id) => {
       try { const r = readJson(path.join(runDir(loc, id), 'run.json')); return `${id}  ${r.status.padEnd(16)} ${r.phase.padEnd(10)} ${isForeign(loc, r) ? `[worktree ${r.repo}] ` : ''}${r.request.split('\n')[0].slice(0, 70)}`; } catch { return `${id}  (unreadable)`; }

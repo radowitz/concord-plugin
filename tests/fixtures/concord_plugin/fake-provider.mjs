@@ -3,7 +3,12 @@
 // FAKE_SCENARIO: JSON file {role: [response, ...]}; a response is an output
 // object, or {"$raw": text} | {"$exit": n} | {"$hang": true} | {"$touch": relpath}.
 // FAKE_CALLS: JSONL log of every invocation.
-import { spawn } from 'node:child_process';
+// Handoff (v0.4.0): `login status` answers per FAKE_CODEX_LOGIN (chatgpt | api | none | garbage); `debug models`
+// serves FAKE_CODEX_MODELS_FILE when set and fails when FAKE_CODEX_MODELS_FAIL=1. Writer roles (codex_task,
+// codex_repair) accept $write {relpath: content} (edits made before the report), $git [[args…], …] (git commands
+// run in the repo, to simulate a writer that tampers with Git state), $error_event "text" (a provider error event
+// followed by turn.failed), $stderr "text", and the usual $exit / $hang / $mode / $raw controls.
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -17,6 +22,11 @@ const DEFAULTS = {
   qa: { verdict: 'pass', summary: 'All good', findings: [] },
 };
 DEFAULTS.proposal_plan = { proposal: DEFAULTS.proposal, plan: DEFAULTS.plan };
+DEFAULTS.codex_task = { status: 'completed', summary: 'Implemented the step', files_changed: ['app.txt'], notes: '' };
+DEFAULTS.codex_repair = { status: 'completed', summary: 'Fixed the reported failures', files_changed: ['app.txt'], notes: '' };
+const WRITERS = ['codex_task', 'codex_repair'];
+// What the handoff must guarantee about the environment and argv; recorded so tests can assert on it.
+const facts = () => ({ has_openai_key: 'OPENAI_API_KEY' in process.env, has_codex_key: 'CODEX_API_KEY' in process.env });
 
 function log(entry) {
   if (process.env.FAKE_CALLS) fs.appendFileSync(process.env.FAKE_CALLS, `${JSON.stringify(entry)}\n`);
@@ -41,8 +51,21 @@ function hang() {
   setInterval(() => {}, 1000);
 }
 
+if (provider === 'codex' && argv[0] === 'login' && argv[1] === 'status') {
+  log({ provider, role: 'login_status', argv, cwd: process.cwd(), ...facts() });
+  const mode = process.env.FAKE_CODEX_LOGIN || 'chatgpt';
+  if (mode === 'warning') { process.stderr.write('WARNING: could not create PATH aliases\nLogged in using ChatGPT\n'); process.exit(0); }
+  if (mode === 'conflict') { process.stderr.write('Logged in using ChatGPT\nLogged in using an API key\n'); process.exit(0); }
+  if (mode === 'nonzero') { process.stderr.write('Logged in using ChatGPT\n'); process.exit(1); }
+  if (mode === 'chatgpt') { process.stderr.write('Logged in using ChatGPT\n'); process.exit(0); }
+  if (mode === 'api') { process.stderr.write('Logged in using an API key - sk-fake***redacted\n'); process.exit(0); }
+  if (mode === 'none') { process.stderr.write('Not logged in\n'); process.exit(1); }
+  process.stdout.write('something unexpected\n'); process.exit(0);
+}
 if (argv[0] === 'debug' && argv[1] === 'models') {
-  log({ provider, argv, cwd: process.cwd() });
+  log({ provider, role: 'debug_models', argv, cwd: process.cwd(), ...facts() });
+  if (process.env.FAKE_CODEX_MODELS_FAIL === '1') { process.stderr.write('model listing unavailable\n'); process.exit(1); }
+  if (process.env.FAKE_CODEX_MODELS_FILE) { fs.writeSync(1, fs.readFileSync(process.env.FAKE_CODEX_MODELS_FILE)); process.exit(0); }
   // FAKE_CODEX_MODELS_BYTES pads each entry like the real catalog (long description and
   // base_instructions, capability fields) until the envelope reaches roughly that size.
   const target = Number(process.env.FAKE_CODEX_MODELS_BYTES || 0);
@@ -73,8 +96,19 @@ if (provider === 'grok' && argv.includes('--help')) {
 const prompt = provider === 'codex' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(arg('--prompt-file'), 'utf8');
 const id = prompt.match(/technical id: ([a-z_]+)/)?.[1];
 const role = prompt.includes('Fast policy') ? 'proposal_plan' : id;
-log({ provider, role, argv, cwd: process.cwd() });
-const r = next(role);
+log({ provider, role, argv, cwd: process.cwd(), ...(provider === 'codex' ? facts() : {}) });
+let r = next(role);
+if (WRITERS.includes(role) && r && typeof r === 'object') {
+  const repo = arg('-C') ?? process.cwd();
+  // Edits (and optional Git tampering) happen before any outcome, like a real writer that fails midway.
+  for (const [rel, content] of Object.entries(r.$write ?? {})) { fs.mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true }); fs.writeFileSync(path.join(repo, rel), content); }
+  for (const a of r.$git ?? []) spawnSync('git', a, { cwd: repo, stdio: 'ignore' });
+  if (r.$stderr) process.stderr.write(r.$stderr);
+  const report = Object.fromEntries(Object.entries(r).filter(([k]) => !k.startsWith('$')));
+  // Controls stay on the object; the answer body is the report keys only (default report when none are given).
+  r = { ...Object.fromEntries(Object.entries(r).filter(([k]) => k.startsWith('$'))), ...(Object.keys(report).length ? report : DEFAULTS[role]) };
+  if (r.$raw === undefined && !r.$touch) r.$raw = JSON.stringify(Object.fromEntries(Object.entries(r).filter(([k]) => !k.startsWith('$'))));
+}
 
 // Optional scenario controls: $silent_ms (no output at first), $hold_ms (pause after the first event so a
 // reader can observe a live log), $mode (grok stream shape), $pieces (raw stdout writes), $delay_ms.
@@ -97,7 +131,8 @@ else {
       line({ type: 'item.completed', item: { id: 'i2', type: 'agent_message', text: body } });
       // $mode: error = unrecovered trailing error; turn_failed = terminal turn.failed; truncated = no terminal event;
       // recovered = a transient error followed by a successful turn.completed.
-      if (r?.$mode === 'error') line({ type: 'error', message: 'codex stream failure' });
+      if (r?.$error_event) { line({ type: 'error', message: r.$error_event }); line({ type: 'turn.failed', error: { message: r.$error_event } }); }
+      else if (r?.$mode === 'error') line({ type: 'error', message: 'codex stream failure' });
       else if (r?.$mode === 'turn_failed') line({ type: 'turn.failed', error: { message: 'codex turn failed hard' } });
       else if (r?.$mode === 'truncated') { /* stream just stops */ }
       else {

@@ -26,6 +26,11 @@ Reference for [SKILL.md](SKILL.md). `H` = `node "${CLAUDE_PLUGIN_ROOT}/scripts/c
 - `H interrupt <run>` stops the running stage (process groups killed) but keeps the run open: the step is recorded `interrupted`, and an `amend` clears the interruption. `H cancel <run>` abandons and closes the run (it can no longer be amended). Stopping the Bash task with `TaskStop` is a best-effort fallback.
 - Everything that runs a helper stage uses a background task with `--one-step`, including the `advance --done …` call after a native step (its `after_done` field gives the tests stage's limit and `timeout_ms`).
 - If the session or helper dies, `/concord:resume` marks the step interrupted and re-runs nothing by itself.
+- Under an approved Codex handoff the writer is one more helper stage (`Concord task-<id> · codex writer (handoff) · <run>`):
+  same lock, logs, `interrupt`, `cancel` and `extend`. Its limit is `limits.role_timeout_s.writer`, else the
+  Codex/Grok limit. `H drive <run>` runs stage after stage in one process and under one lock until a human is
+  needed; it is meant for a plain terminal when Claude is unavailable. In a session, prefer one labelled
+  `advance --one-step` task per stage.
 
 ## Amendments (`amend`)
 

@@ -68,7 +68,8 @@ export class Normalizer {
     }
     if (t === 'turn.failed' || t === 'error') {
       this.recognized++;
-      const msg = clip(o.message ?? o.error?.message ?? 'provider reported an error', 500);
+      const value = o.message ?? (typeof o.error === 'string' ? o.error : o.error?.message);
+      const msg = clip(typeof value === 'string' ? value : 'provider reported an error', 500);
       this.errors.push(msg);
       if (t === 'turn.failed') this.failed = msg; else this.unrecovered = msg;
       return { event: { type: 'error', message: msg }, progress: `provider error: ${msg}` };
